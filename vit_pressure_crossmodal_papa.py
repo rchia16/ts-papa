@@ -295,9 +295,12 @@ def train_one_epoch_papa(model: nn.Module, loader, optimizer, device: str, args,
         "resp_rr": [],
         "resp_recon": [],
     }
-
     for batch in loader:
         imu, pressure, _, br, _ = core.unpack_batch(batch, device)
+
+        if not args.use_device_br:
+            br = None    
+
         optimizer.zero_grad(set_to_none=True)
 
         pred_logmag, rr_pred, hidden = model(imu)
@@ -1050,6 +1053,7 @@ def main() -> None:
             "Reconstructs the raw physiological summary from the respiration-state bottleneck."
         ),
     )
+    parser.add_argument("--use-device-br", action="store_true")
 
     args = parser.parse_args()
 

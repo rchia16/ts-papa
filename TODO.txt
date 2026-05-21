@@ -1,0 +1,52 @@
+no-bottleneck outperforms, compressing all the info suffers in performance
+we want to find a way to perform subject-level mixture/gating over respiration
+experts --> each subject performance preference differs greatly
+
+maybe we can choose or weight the best classifier family
+
+experts = {
+    "abs": hybrid_abs_classifier,
+    "dyn_abs": hybrid_dyn_abs_classifier,
+    "z": hybrid_z_classifier,
+    "dyn_hmm": hybrid_dyn_abs_hmm_classifier,
+    "rr": rr_abs_classifier,
+}
+
+Then learn a source-only gate using leave-one-source-subject-out meta-training
+
+Maybe a weighted probability mixture:
+p(y_t) = Eps_k alpha_k(target_stats) p_k(y_t)
+
+This directly addresses the fact that some subjects are best handled by
+absolute state, some by dynamics, and some by calibration.
+
+Use an ordinal latent respiratory workload score, not a nominal 3-class LDA.
+IMU → reconstructed respiratory trajectory d_t
+d_t → latent respiratory load score s_t
+s_t + temporal prior → L0/L2/L3
+
+With subject calibration:
+
+s_t = wᵀ φ(d_t) + b_subject
+
+where φ(d_t) includes entropy, bandwidth, peakness loss, RR shift, fast-slow 
+drift, and disagreement. For the target subject, estimate only an 
+intercept/scale from unlabeled low-drive windows, then infer labels with 
+ordered thresholds:
+
+L0 if s_t < τ1
+L2 if τ1 ≤ s_t < τ2
+L3 if s_t ≥ τ2
+
+This would preserve the idea that MWL is a trajectory on a respiratory stress 
+axis, not a cluster label in arbitrary embedding space.
+
+Next:
+LADDER="rr_abs,stft_abs,dyn_abs,state_abs,hybrid_abs,hybrid_dyn_abs,hybrid_dyn_abs_hmm,hybrid_z,hybrid_z_hmm"
+Then add the subject-level gate/ensemble. I would also report three summaries:
+
+best fixed variant
+oracle best per subject
+learned gate best per subject
+The gap between fixed and oracle will tell you how much performance is 
+currently being lost because the correct respiratory normalization differs by subject.

@@ -342,14 +342,22 @@ def contrast_weight_for_epoch(args, epoch: int) -> float:
     return min_weight + progress * (max_weight - min_weight)
 
 
-def train_one_epoch(model: nn.Module, loader, optimizer, device: str, args, lambda_contrast: float) -> EpochMetrics:
+def train_one_epoch(
+    model:nn.Module, loader, optimizer, device:str, args, 
+    lambda_contrast:float,
+) -> EpochMetrics:
     model.train()
     totals = {"loss": [], "stft": [], "rr": [], "contrast": []}
+
     for batch in loader:
         imu, pressure, _, br, _ = unpack_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
+        if not args.use_device_br:
+            br = None
+
         pred_logmag, rr_pred, _hidden = model(imu)
+
         loss, parts = pressure_stft_recon_loss(
             model,
             pred_logmag,
@@ -386,9 +394,13 @@ def evaluate(model: nn.Module, loader, device: str, args, save_arrays: Optional[
     losses, parts_all = [], {"stft": [], "rr": []}
     pred_specs, true_specs = [], []
     rr_preds, rr_trues = [], []
-
+ 
     for batch in loader:
         imu, pressure, _, br, _ = unpack_batch(batch, device)
+
+        if not args.use_device_br:
+            br = None
+
         pred_logmag, rr_pred, _ = model(imu)
         loss, parts = pressure_stft_recon_loss(
             model,
@@ -457,12 +469,17 @@ def collect_source_tta_stats(model: nn.Module, loader, device: str, args) -> Dic
     model.eval()
     zs, rrs = [], []
     max_batches = int(args.tta_source_batches)
+
     for bi, batch in enumerate(loader):
         if max_batches > 0 and bi >= max_batches:
             break
         imu, pressure, _, br, _ = unpack_batch(batch, device)
         _, _rr_pred, hidden = model(imu)
         z = pooled_features(hidden)
+
+        if not args.use_device_br:
+            br = None    
+
         rr_true = rr_targets_from_batch(pressure, br)
         zs.append(z.detach())
         rrs.append(rr_true.detach())
@@ -864,6 +881,7 @@ def build_base_parser(default_subjects_list: List[str], default_out_dir: str) ->
     parser.add_argument("--lambda-tta-rrspec", type=float, default=0.10)
     parser.add_argument("--lambda-tta-smooth", type=float, default=0.02)
     parser.add_argument("--lambda-tta-proto", type=float, default=0.05)
+    parser.add_argument("--use-device-br", action="store_true")
     return parser
 
 

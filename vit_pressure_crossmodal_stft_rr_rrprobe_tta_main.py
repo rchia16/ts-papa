@@ -45,7 +45,8 @@ class RRLinearProbe(nn.Module):
 
 
 @torch.no_grad()
-def _collect_rr_probe_arrays(model: nn.Module, loader, device: str, max_batches: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+def _collect_rr_probe_arrays(model: nn.Module, loader, device: str, args,
+                             max_batches: int = 0) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
     xs, ys = [], []
     for bi, batch in enumerate(loader):
@@ -54,6 +55,10 @@ def _collect_rr_probe_arrays(model: nn.Module, loader, device: str, max_batches:
         imu, pressure, _, br, _ = unpack_batch(batch, device)
         hidden = model.encode(imu)
         z = pooled_features(hidden)
+
+        if not args.use_device_br:
+            br = None
+
         rr_true = rr_targets_from_batch(pressure, br)
         xs.append(z.detach().cpu().numpy())
         ys.append(rr_true.detach().cpu().numpy().reshape(-1))
@@ -215,8 +220,10 @@ def _adapt_rr_probe_tta(probe: RRLinearProbe, x_source: np.ndarray, y_source: np
 def rr_probe_evaluate(model: nn.Module, train_loader, test_loader, subject: str, device: str, args, out_dir: Optional[Path] = None) -> Dict[str, float]:
     for p in model.parameters():
         p.requires_grad = False
-    x_source, y_source = _collect_rr_probe_arrays(model, train_loader, device, max_batches=int(args.rr_probe_source_batches))
-    x_target, y_target = _collect_rr_probe_arrays(model, test_loader, device, max_batches=0)
+        x_source, y_source = _collect_rr_probe_arrays(model, train_loader, device,
+                                                      args, max_batches=int(args.rr_probe_source_batches))
+        x_target, y_target = _collect_rr_probe_arrays(model, test_loader, device,
+                                                      args, max_batches=0)
     probe = RRLinearProbe(x_source.shape[1], adapter_scale=float(args.rr_probe_adapter_scale)).to(device)
     probe = _train_rr_probe_source(probe, x_source, y_source, args, device)
     pred_pre, _ = _predict_rr_probe(probe, x_target, device)
