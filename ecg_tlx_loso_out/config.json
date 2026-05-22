@@ -1,0 +1,24 @@
+{
+  "data_root": "/projects/BLVMob/aria_seated/Data",
+  "tlx_csv": "/projects/BLVMob/imu-rr-seated/Data/seated_tlx.csv",
+  "conditions": [
+    "L0",
+    "L2",
+    "L3"
+  ],
+  "out_dir": "ecg_tlx_loso_out",
+  "ecg_col": "ecg",
+  "fs": 250.0,
+  "window_sec": 60.0,
+  "shift_sec": 10.0,
+  "min_hr_bpm": 35.0,
+  "max_hr_bpm": 220.0,
+  "rest_condition": "R",
+  "min_valid_fraction": 0.8,
+  "min_windows_per_subject_condition": 1,
+  "normalize_mode": "relative",
+  "lda_features": [
+    "rri_norm",
+    "hr_norm"
+  ]
+}

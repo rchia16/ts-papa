@@ -310,6 +310,7 @@ def make_dataset(
     data_group: Optional[str] = None,
     include_tlx: bool = False,
     include_ecg: bool = False,
+    include_marker: bool = False,
     tlx_csv_path: Optional[str] = None,
     tlx_table: Optional[dict] = None,
 ):
@@ -336,6 +337,15 @@ def make_dataset(
                 "Re-run preprocessing for those subjects or disable include_ecg."
             )
         ecg = np.concatenate(ecg_parts, axis=0)
+    marker = None
+    if include_marker:
+        marker_parts = [data.get('marker_filt') for data in data_list]
+        if any(part is None for part in marker_parts):
+            raise ValueError(
+                "include_marker=True but at least one subject is missing 'marker_filt'. "
+                "Re-run preprocessing for those subjects with marker data or disable include_marker."
+            )
+        marker = np.concatenate(marker_parts, axis=0)
     br = np.concatenate(
         [data['br'] for data in data_list], axis=0
     )
@@ -371,22 +381,26 @@ def make_dataset(
         pss = pss[idxs]
         if ecg is not None:
             ecg = ecg[idxs]
+        if marker is not None:
+            marker = marker[idxs]
         br = br[idxs]
         cond = cond[idxs]
         if tlx is not None:
             tlx = tlx[idxs]
 
-    if include_tlx and include_ecg:
-        return x, pss, br, cond, tlx, ecg
+    out = [x, pss, br, cond]
     if include_tlx:
-        return x, pss, br, cond, tlx
+        out.append(tlx)
     if include_ecg:
-        return x, pss, br, cond, ecg
-    return x, pss, br, cond
+        out.append(ecg)
+    if include_marker:
+        out.append(marker)
+    return tuple(out)
 
 # Load data to dataloader
 class LoadDataset(Dataset):
-    def __init__(self, x, y=None, cond=None, br=None, tlx=None, ecg=None, aug_ratio=0.3, preserve_layout: bool = False):
+    def __init__(self, x, y=None, cond=None, br=None, tlx=None, ecg=None,
+                 marker=None, aug_ratio=0.3, preserve_layout: bool = False):
         self.len = len(x)
         self.preserve_layout = bool(preserve_layout)
         if isinstance(x, np.ndarray):
@@ -433,6 +447,13 @@ class LoadDataset(Dataset):
         else:
             self.ecg = ecg
 
+        if marker is not None and isinstance(marker, np.ndarray):
+            self.marker = torch.from_numpy(marker).float()
+        elif marker is not None and not isinstance(marker, np.ndarray):
+            self.marker = marker.float()
+        else:
+            self.marker = marker
+
         if aug_ratio > 0:
             if self.preserve_layout:
                 raise ValueError("Augmentation is not supported when preserve_layout=True.")
@@ -443,6 +464,18 @@ class LoadDataset(Dataset):
             if cond is not None:
                 c_aug = self.cond[aug_idxs]
                 self.cond = torch.cat((self.cond, c_aug), dim=0)
+            if br is not None:
+                br_aug = self.br[aug_idxs]
+                self.br = torch.cat((self.br, br_aug), dim=0)
+            if tlx is not None:
+                tlx_aug = self.tlx[aug_idxs]
+                self.tlx = torch.cat((self.tlx, tlx_aug), dim=0)
+            if ecg is not None:
+                ecg_aug = self.ecg[aug_idxs]
+                self.ecg = torch.cat((self.ecg, ecg_aug), dim=0)
+            if marker is not None:
+                marker_aug = self.marker[aug_idxs]
+                self.marker = torch.cat((self.marker, marker_aug), dim=0)
 
             # channels first
             x_aug_tmp = x_aug.permute(0, 2, 1)
@@ -465,32 +498,27 @@ class LoadDataset(Dataset):
             else:
                 self.x = torch.cat((self.x, x_aug), dim=0)
                 self.y = torch.cat((self.y, y_aug), dim=0)
+            self.len = len(self.x)
 
     def __getitem__(self, index):
-        if self.y is not None and self.cond is not None \
-                and self.br is not None and self.tlx is not None and self.ecg is not None:
-            return self.x[index], self.y[index], self.cond[index], self.br[index], self.tlx[index], self.ecg[index]
-        elif self.y is not None and self.cond is not None \
-                and self.br is not None and self.ecg is not None:
-            return self.x[index], self.y[index], self.cond[index], self.br[index], self.ecg[index]
-        elif self.y is not None and self.cond is not None \
-                and self.br is not None and self.tlx is not None:
-            return self.x[index], self.y[index], self.cond[index], self.br[index], self.tlx[index]
-        elif self.y is not None and self.cond is not None \
-                and self.br is not None:
-            return self.x[index], self.y[index], self.cond[index], self.br[index]
-        elif self.y is not None and self.cond is not None and self.tlx is not None:
-            return self.x[index], self.y[index], self.cond[index], self.tlx[index]
-        elif self.y is not None and self.cond is not None:
-            return self.x[index], self.y[index], self.cond[index]
-        elif self.y is not None:
-            return self.x[index], self.y[index]
-        else:
+        if self.y is None:
             item = {
                 'past_values': self.x[index].float(),
                 'past_observed_mask': torch.ones_like(self.x[index]).float(),
             }
             return item
+        out = [self.x[index], self.y[index]]
+        if self.cond is not None:
+            out.append(self.cond[index])
+        if self.br is not None:
+            out.append(self.br[index])
+        if self.tlx is not None:
+            out.append(self.tlx[index])
+        if self.ecg is not None:
+            out.append(self.ecg[index])
+        if self.marker is not None:
+            out.append(self.marker[index])
+        return tuple(out)
 
     def __len__(self):
         return self.len
@@ -515,6 +543,7 @@ def build_loocv_loaders(
     data_group: Optional[str] = None,
     include_tlx: bool = False,
     include_ecg: bool = False,
+    include_marker: bool = False,
     tlx_csv_path: Optional[str] = None,
 ):
     def _call_subject_loader(loader_fn, subject_name: str):
@@ -533,6 +562,7 @@ def build_loocv_loaders(
         data_group=data_group,
         include_tlx=include_tlx,
         include_ecg=include_ecg,
+        include_marker=include_marker,
         tlx_csv_path=tlx_csv_path,
     )
     test_out = dataset_builder(
@@ -541,24 +571,22 @@ def build_loocv_loaders(
         data_group=data_group,
         include_tlx=include_tlx,
         include_ecg=include_ecg,
+        include_marker=include_marker,
         tlx_csv_path=tlx_csv_path,
     )
-    if include_tlx and include_ecg:
-        x_train, y_train, br_train, cond_train, tlx_train, ecg_train = train_out
-        x_test,  y_test,  br_test,  cond_test,  tlx_test,  ecg_test = test_out
-    elif include_tlx:
-        x_train, y_train, br_train, cond_train, tlx_train = train_out
-        x_test,  y_test,  br_test,  cond_test,  tlx_test  = test_out
-        ecg_train, ecg_test = None, None
-    elif include_ecg:
-        x_train, y_train, br_train, cond_train, ecg_train = train_out
-        x_test,  y_test,  br_test,  cond_test,  ecg_test  = test_out
-        tlx_train, tlx_test = None, None
-    else:
-        x_train, y_train, br_train, cond_train = train_out
-        x_test,  y_test,  br_test,  cond_test  = test_out
-        tlx_train, tlx_test = None, None
-        ecg_train, ecg_test = None, None
+    x_train, y_train, br_train, cond_train = train_out[:4]
+    x_test,  y_test,  br_test,  cond_test  = test_out[:4]
+    train_extra = list(train_out[4:])
+    test_extra = list(test_out[4:])
+    tlx_train, tlx_test = None, None
+    ecg_train, ecg_test = None, None
+    marker_train, marker_test = None, None
+    if include_tlx:
+        tlx_train, tlx_test = train_extra.pop(0), test_extra.pop(0)
+    if include_ecg:
+        ecg_train, ecg_test = train_extra.pop(0), test_extra.pop(0)
+    if include_marker:
+        marker_train, marker_test = train_extra.pop(0), test_extra.pop(0)
 
     if autoencoder is not None:
         prefix = f'{sbj}_{data_str}_'
@@ -582,6 +610,8 @@ def build_loocv_loaders(
         tlx_val = tlx_train[val_idxs]
     if include_ecg:
         ecg_val = ecg_train[val_idxs]
+    if include_marker:
+        marker_val = marker_train[val_idxs]
 
     x_train = x_train[train_idxs]
     y_train = y_train[train_idxs]
@@ -591,40 +621,43 @@ def build_loocv_loaders(
         tlx_train = tlx_train[train_idxs]
     if include_ecg:
         ecg_train = ecg_train[train_idxs]
+    if include_marker:
+        marker_train = marker_train[train_idxs]
 
-    if include_tlx and include_ecg:
-        train_data_to_load = (x_train, y_train, cond_train, br_train, tlx_train, ecg_train)
-        val_data_to_load   = (x_val, y_val, cond_val, br_val, tlx_val, ecg_val)
-        test_data_to_load  = (x_test, y_test, cond_test, br_test, tlx_test, ecg_test)
-    elif include_tlx:
-        train_data_to_load = (x_train, y_train, cond_train, br_train, tlx_train)
-        val_data_to_load   = (x_val, y_val, cond_val, br_val, tlx_val)
-        test_data_to_load  = (x_test, y_test, cond_test, br_test, tlx_test)
-    elif include_ecg:
-        train_data_to_load = (x_train, y_train, cond_train, br_train, ecg_train)
-        val_data_to_load   = (x_val, y_val, cond_val, br_val, ecg_val)
-        test_data_to_load  = (x_test, y_test, cond_test, br_test, ecg_test)
-    else:
-        train_data_to_load = (x_train, y_train, cond_train, br_train)
-        val_data_to_load   = (x_val, y_val, cond_val, br_val)
-        test_data_to_load  = (x_test, y_test, cond_test, br_test)
+    def _dataset(x, y, cond, br, tlx=None, ecg=None, marker=None, aug_ratio=0.0):
+        return LoadDataset(
+            x, y, cond=cond, br=br, tlx=tlx, ecg=ecg, marker=marker,
+            aug_ratio=aug_ratio, preserve_layout=preserve_layout,
+        )
 
     train_dataloader = DataLoader(
-        LoadDataset(*train_data_to_load, aug_ratio=train_aug_ratio, preserve_layout=preserve_layout),
+        _dataset(
+            x_train, y_train, cond_train, br_train,
+            tlx=tlx_train, ecg=ecg_train, marker=marker_train,
+            aug_ratio=train_aug_ratio,
+        ),
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
         **_loader_kwargs(),
     )
     val_dataloader = DataLoader(
-        LoadDataset(*val_data_to_load, aug_ratio=0.0, preserve_layout=preserve_layout),
+        _dataset(
+            x_val, y_val, cond_val, br_val,
+            tlx=tlx_val if include_tlx else None,
+            ecg=ecg_val if include_ecg else None,
+            marker=marker_val if include_marker else None,
+        ),
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
         **_loader_kwargs(),
     )
     test_dataloader = DataLoader(
-        LoadDataset(*test_data_to_load, aug_ratio=0.0, preserve_layout=preserve_layout),
+        _dataset(
+            x_test, y_test, cond_test, br_test,
+            tlx=tlx_test, ecg=ecg_test, marker=marker_test,
+        ),
         batch_size=batch_size,
         shuffle=False,
         drop_last=drop_last,
@@ -646,6 +679,7 @@ def loocv_generator(
     data_group: Optional[str] = None,
     include_tlx: bool = False,
     include_ecg: bool = False,
+    include_marker: bool = False,
     tlx_csv_path: Optional[str] = None,
 ):
     for sbj in subjects:
@@ -663,6 +697,7 @@ def loocv_generator(
             data_group=data_group,
             include_tlx=include_tlx,
             include_ecg=include_ecg,
+            include_marker=include_marker,
             tlx_csv_path=tlx_csv_path,
         )
 

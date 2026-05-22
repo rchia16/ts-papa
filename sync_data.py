@@ -69,6 +69,56 @@ def find_column(df, text):
     return None
 
 
+def marker_data_columns(df):
+    keep_cols = {
+        "glasses_rotation_x",
+        "glasses_rotation_y",
+        "glasses_rotation_z",
+        "glasses_rotation",
+        "glasses_position_x",
+        "glasses_position_y",
+        "glasses_position_z",
+    }
+    return [
+        col for col in df.columns
+        if str(col).lower() in keep_cols and pd.api.types.is_numeric_dtype(df[col])
+    ]
+
+
+def marker_columns_for_export(df):
+    return ["marker_" + str(col).replace(":", "_").replace(" ", "_") for col in marker_data_columns(df)]
+
+
+def interpolate_marker_to_times(marker_df, target_times):
+    if marker_df.empty or "sec" not in marker_df.columns:
+        return pd.DataFrame(index=np.arange(len(target_times)))
+
+    marker_times = marker_df["sec"].to_numpy(dtype=float)
+    valid_time = np.isfinite(marker_times)
+    if valid_time.sum() < 2:
+        return pd.DataFrame(index=np.arange(len(target_times)))
+
+    marker_df = marker_df.loc[valid_time].sort_values("sec")
+    marker_times = marker_df["sec"].to_numpy(dtype=float)
+    target_times = np.asarray(target_times, dtype=float)
+    out = {}
+
+    for col in marker_data_columns(marker_df):
+        values = pd.to_numeric(marker_df[col], errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(values)
+        if valid.sum() < 2:
+            continue
+        out["marker_" + str(col).replace(":", "_").replace(" ", "_")] = np.interp(
+            target_times,
+            marker_times[valid],
+            values[valid],
+            left=np.nan,
+            right=np.nan,
+        )
+
+    return pd.DataFrame(out)
+
+
 class DataSynchronizer:
     def __init__(self):
         self.start_ind = None
@@ -175,11 +225,19 @@ class SubjectData:
         data_dir = path_join(self.subject_dir, "Motive Logs")
         data_glob = path_join(data_dir, "*_amended.csv") if path_exists(data_dir) else path_join(self.subject_dir, "*Take*_amended.csv")
         data_files = sorted(glob.glob(data_glob))
+        if len(data_files) == 0:
+            self.marker_fname = ""
+            self.marker_hdr_fname = ""
+            return
         if self.subject_id > 16:
             if self.condition in "MR":
                 data_files = [fname for fname in data_files if "MR" in fname]
             else:
                 data_files = [fname for fname in data_files if "MR" not in fname]
+        if len(data_files) == 0:
+            self.marker_fname = ""
+            self.marker_hdr_fname = ""
+            return
         self.marker_fname = self.check_times(data_files) if len(data_files) > 1 else data_files[-1]
         self.marker_hdr_fname = self.marker_fname.split("_amended")[0] + "_header.csv"
 
@@ -277,7 +335,7 @@ class SubjectData:
         return pd.read_csv(filename, skiprows=1, nrows=1, usecols=list(range(0, 22)), header=None)
 
     def import_marker_data(self):
-        col_keys = ["frame", "time (seconds)", "mean marker error", "marker quality", "marker", "position", "rotation", "x", "y", "z"]
+        col_keys = ["time (seconds)", "glasses", "position", "rotation", "x", "y", "z"]
         header = self.import_header_file(self.marker_hdr_fname)
         df = self.import_marker_file(self.marker_fname)
         if df.shape[1] > 38:
@@ -293,6 +351,8 @@ class SubjectData:
                     col_val.append(str_val.replace(" ", "_"))
             new_cols.append("_".join(col_val))
         df.columns = new_cols
+        keep_cols = ["Time_(Seconds)"] + marker_data_columns(df)
+        df = df[keep_cols]
         return df, dict(header.values.reshape((11, 2)).tolist())
 
     def load_dataframes(self):
@@ -303,7 +363,10 @@ class SubjectData:
             self.ecg_df = self.import_labels(self.ecg_fname)
         if self.read_marker_data:
             try:
-                self.marker_df, self.mkr_hdr = self.import_marker_data()
+                if self.marker_fname and self.marker_hdr_fname:
+                    self.marker_df, self.mkr_hdr = self.import_marker_data()
+                else:
+                    print("No marker data found on {0} - {1}".format(self.subject_id, self.condition))
             except Exception:
                 print("error reading marker data on {0} - {1}".format(self.subject_id, self.condition))
         if self.subject_id not in NO_HACC_ID:
@@ -363,6 +426,8 @@ class SubjectData:
         data_sync = DataSynchronizer()
         data_sync.set_bounds(marker_time, self.study_start, self.study_end)
         self.marker_df = data_sync.sync_df(self.marker_df).fillna(0)
+        keep_cols = ["Time_(Seconds)", "sec"] + marker_data_columns(self.marker_df)
+        self.marker_df = self.marker_df[keep_cols]
 
     def sync_imu_df(self):
         na_inds = self.imu_df.loc[pd.isna(self.imu_df["accelerometer"]), :].index.values
@@ -496,12 +561,32 @@ async def sync_main(**kwargs):
             sbj_data.imu_df.to_csv(path_join(sbj_dir, "{0}_imu_df.csv".format(condition)), index=index)
 
         if sbj_data.read_marker_data and not sbj_data.marker_df.empty:
-            sbj_data.marker_df.to_csv(path_join(sbj_dir, "{0}_marker_df.csv".format(condition)), index=index)
+            sbj_data.marker_df.to_csv(
+                path_join(
+                    sbj_dir, "{0}_marker_df.csv".format(condition)
+                ),
+                index=index
+            )
 
-        sbj_data.pressure_df.to_csv(path_join(sbj_dir, "{0}_pressure_df.csv".format(condition)), index=index)
-        sbj_data.summary_df.to_csv(path_join(sbj_dir, "{0}_summary_df.csv".format(condition)), index=index)
+        sbj_data.pressure_df.to_csv(
+            path_join(
+                sbj_dir, "{0}_pressure_df.csv".format(condition)
+            ),
+            index=index
+        )
+        sbj_data.summary_df.to_csv(
+            path_join(
+                sbj_dir, "{0}_summary_df.csv".format(condition)
+            ),
+            index=index
+        )
         if not sbj_data.accel_df.empty:
-            sbj_data.accel_df.to_csv(path_join(sbj_dir, "{0}_accel_df.csv".format(condition)), index=index)
+            sbj_data.accel_df.to_csv(
+                path_join(
+                    sbj_dir, "{0}_accel_df.csv".format(condition)
+                ),
+                index=index
+            )
         if not sbj_data.ecg_df.empty:
             sbj_data.ecg_df.to_csv(path_join(sbj_dir, "{0}_ecg_df.csv".format(condition)), index=index)
 
@@ -515,18 +600,42 @@ async def sync_main(**kwargs):
             gyr_data = np.stack(data_df["gyroscope"].values)
             x_time = data_df["sec"].values.reshape(-1, 1)
 
-            br_col = [col for col in pss_df.columns.values if "breathing" in col.lower()][0]
-            pss_data = np.interp(x_time, pss_df["sec"].values, pss_df[br_col].values).reshape(-1, 1)
+            br_col = [
+                col for col in pss_df.columns.values \
+                if "breathing" in col.lower()
+            ][0]
+            pss_data = np.interp(
+                x_time, pss_df["sec"].values, 
+                pss_df[br_col].values
+            ).reshape(-1, 1)
 
-            br_lbl = [col for col in lbl_df.columns.values if "br" in col.lower()][0]
-            lbl_data = np.interp(x_time, lbl_df["sec"].values, lbl_df[br_lbl].values).reshape(-1, 1)
+            br_lbl = [col for col in lbl_df.columns.values if "br" in \
+                      col.lower()][0]
+            lbl_data = np.interp(x_time, lbl_df["sec"].values, 
+                                 lbl_df[br_lbl].values).reshape(-1, 1)
 
-            xsens_data = np.concatenate((x_time, lbl_data, pss_data, acc_data, gyr_data), axis=1)
-            columns = ["sec", "BR", "PSS", "acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z"]
+            xsens_data = np.concatenate(
+                (x_time, lbl_data, pss_data, acc_data, gyr_data),
+                axis=1
+            )
+            columns = [
+                "sec", "BR", "PSS",
+                "acc_x", "acc_y", "acc_z",
+                "gyr_x", "gyr_y", "gyr_z"
+            ]
             xsens_df = pd.DataFrame(xsens_data, columns=columns)
+            if sbj_data.read_marker_data and not sbj_data.marker_df.empty:
+                marker_df = interpolate_marker_to_times(
+                    sbj_data.marker_df, data_df["sec"].values)
+                if not marker_df.empty:
+                    xsens_df = pd.concat([xsens_df, marker_df], axis=1)
             xsens_df["condition"] = condition
             xsens_df["subject"] = sbj_data.subject_id
-            re_order = ["sec", "BR", "PSS", "condition", "subject", "acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z"]
+            re_order = [
+                "sec", "BR", "PSS", "condition", "subject",
+                "acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z",
+            ] + marker_columns_for_export(sbj_data.marker_df)
+            re_order = [col for col in re_order if col in xsens_df.columns]
             xsens_df[re_order].to_csv(xsens_csv, index=False)
             print("xsens df saved for {0} - {1}".format(sbj_data.subject_id, condition))
 

@@ -26,6 +26,21 @@ from tsfresh.utilities.string_manipulation import get_config_from_string
 from config import WINDOW_SIZE, WINDOW_SHIFT, IMU_FS, PSS_FS, ECG_FS
 from config import IMU_FS, DATA_DIR, SEAT_DATA_DIR
 
+def marker_data_columns(df):
+    keep_cols = {
+        "glasses_rotation_x",
+        "glasses_rotation_y",
+        "glasses_rotation_z",
+        "glasses_rotation",
+        "glasses_position_x",
+        "glasses_position_y",
+        "glasses_position_z",
+    }
+    return [
+        col for col in df.columns
+        if str(col).lower() in keep_cols and pd.api.types.is_numeric_dtype(df[col])
+    ]
+
 def reshape_array(data):
     shape = data.shape
     return data.reshape((shape[0], shape[2], shape[1]))
@@ -362,7 +377,7 @@ def sync_df(df, time_tuple):
 
 # def prepare_multimodal(
 def prepare_multimodal(
-    imu_df, pss_df, ecg_df=None, window_size=30, window_shift=15
+    imu_df, pss_df, ecg_df=None, marker_df=None, window_size=30, window_shift=15
 ):
     imu_sec = imu_df['sec']
     pss_sec = pss_df['sec']
@@ -376,8 +391,17 @@ def prepare_multimodal(
     pss_win_size = int(window_size * PSS_FS)
     ecg_win_size = int(window_size * ECG_FS) if ecg_df is not None else None
     ecg_sec = ecg_df['sec'] if ecg_df is not None else None
+    marker_win_size = int(window_size * IMU_FS) if marker_df is not None else None
+    marker_sec = marker_df['sec'] if marker_df is not None else None
+    marker_cols = marker_data_columns(marker_df) if marker_df is not None else []
+    if marker_df is not None and (
+        len(marker_cols) == 0 or len(marker_df) < marker_win_size
+    ):
+        marker_df = None
+        marker_win_size = None
+        marker_sec = None
 
-    imu_wins, pss_wins, ecg_wins = [], [], []
+    imu_wins, pss_wins, ecg_wins, marker_wins = [], [], [], []
     for win in wins:
         if win[-1] == 0: break
         imu_win = imu_df.iloc[win]
@@ -390,6 +414,11 @@ def prepare_multimodal(
             ecg_diff = np.abs(ecg_sec - imu_win['sec'].iloc[0])
             ecg_idx = ecg_diff.argmin()
             ecg_win = ecg_df.iloc[ecg_idx:ecg_idx+ecg_win_size]
+        marker_win = None
+        if marker_df is not None:
+            marker_diff = np.abs(marker_sec - imu_win['sec'].iloc[0])
+            marker_idx = marker_diff.argmin()
+            marker_win = marker_df.iloc[marker_idx:marker_idx+marker_win_size]
 
         imu_sec0 = datetime.fromtimestamp(imu_win['sec'].iloc[0])
         pss_sec0 = datetime.fromtimestamp(pss_win['sec'].iloc[0])
@@ -403,6 +432,8 @@ def prepare_multimodal(
         pss_wins.append(pss_win)
         if ecg_df is not None:
             ecg_wins.append(ecg_win)
+        if marker_df is not None:
+            marker_wins.append(marker_win)
 
     if len(imu_wins) == 0 or len(pss_wins) == 0:
         return
@@ -427,6 +458,7 @@ def prepare_multimodal(
 
     pss_time = [pwin['sec'].values for pwin in pss_wins]
     ecg_time = [ewin['sec'].values for ewin in ecg_wins] if ecg_df is not None else None
+    marker_time = [mwin['sec'].values for mwin in marker_wins] if marker_df is not None else None
 
     freq_func = partial(get_max_freq, fs=PSS_FS)
     with Pool(cpu_count()//2) as p:
@@ -441,6 +473,12 @@ def prepare_multimodal(
                 ecg_func,
                 map(lambda ewin: ewin['ecg'].values, ecg_wins)
             )
+    marker_filt = None
+    if marker_df is not None:
+        marker_filt = [
+            mwin[marker_cols].apply(pd.to_numeric, errors='coerce').interpolate().fillna(0).values
+            for mwin in marker_wins
+        ]
 
     # double check if there are any fractured samples
     if not isinstance(imu_filt, np.ndarray) and \
@@ -457,11 +495,17 @@ def prepare_multimodal(
             ecg_win_len = window_size*ECG_FS
             ecg_idxs = [i for i, data in enumerate(ecg_filt) if
                                len(data)!=ecg_win_len]
+        marker_idxs = []
+        if marker_filt is not None:
+            marker_win_len = window_size*IMU_FS
+            marker_idxs = [i for i, data in enumerate(marker_filt) if
+                               len(data)!=marker_win_len]
 
         # filter out any that do not meet time requirement
-        idxs_reject = np.unique([imu_idxs+pss_idxs+ecg_idxs])
+        idxs_reject = np.unique([imu_idxs+pss_idxs+ecg_idxs+marker_idxs])
         idxs_to_keep = [i for i in range(len(imu_filt)) if i not in
                         idxs_reject]
+
         imu_filt = [data for i, data in enumerate(imu_filt) if i in idxs_to_keep]
         imu_time = [data for i, data in enumerate(imu_time) if i in idxs_to_keep]
         pss_filt = [data for i, data in enumerate(pss_filt) if i in idxs_to_keep]
@@ -472,6 +516,9 @@ def prepare_multimodal(
         if ecg_filt is not None:
             ecg_filt = [data for i, data in enumerate(ecg_filt) if i in idxs_to_keep]
             ecg_time = [data for i, data in enumerate(ecg_time) if i in idxs_to_keep]
+        if marker_filt is not None:
+            marker_filt = [data for i, data in enumerate(marker_filt) if i in idxs_to_keep]
+            marker_time = [data for i, data in enumerate(marker_time) if i in idxs_to_keep]
         conds_wins = [data for i, data in enumerate(conds_wins) if i in idxs_to_keep]
 
     if not isinstance(imu_filt, np.ndarray):
@@ -488,13 +535,20 @@ def prepare_multimodal(
         ecg_filt = np.array(ecg_filt)
     if ecg_time is not None and not isinstance(ecg_time, np.ndarray):
         ecg_time = np.array(ecg_time)
+    if marker_filt is not None and not isinstance(marker_filt, np.ndarray):
+        marker_filt = np.array(marker_filt)
+    if marker_time is not None and not isinstance(marker_time, np.ndarray):
+        marker_time = np.array(marker_time)
 
     if len(conds_wins) != len(pss_freqs):
         ipdb.set_trace()
 
-    if ecg_filt is None:
-        return imu_filt, pss_filt, pss_freqs, pss_time, conds_wins
-    return imu_filt, pss_filt, pss_freqs, pss_time, conds_wins, ecg_filt, ecg_time
+    out = [imu_filt, pss_filt, pss_freqs, pss_time, conds_wins]
+    if ecg_filt is not None:
+        out.extend([ecg_filt, ecg_time])
+    if marker_filt is not None:
+        out.extend([marker_filt, marker_time, marker_cols])
+    return tuple(out)
 
 def attach_condition_to_df(fname, df):
     file_condition = fname.split(sep)[-1].split('_')[0]
@@ -580,6 +634,27 @@ def load_and_sync_xsens(subject, condition='M', data_dir=SEAT_DATA_DIR):
         ecg_df.sort_values(by='sec', inplace=True)
         ecg_df.reset_index(drop=True, inplace=True)
 
+    marker_glob = glob_wrapper(condition, 'marker')
+    marker_list = get_file_list(data_dir, marker_glob, sbj=subject)
+    if len(marker_list) == 0:
+        marker_list = get_file_list(data_dir, f'*{condition}_marker_df*',
+                                    sbj=subject)
+    marker_df = None
+    if len(marker_list) > 0:
+        marker_dfs = [
+            attach_condition_to_df(fname, pd.read_csv(fname)) for fname in marker_list
+        ]
+        marker_df = pd.concat(marker_dfs, axis=0)
+        if 'sec' not in marker_df.columns:
+            raise ValueError(
+                f"Marker dataframe is missing 'sec' for subject={subject}, "
+                f"condition={condition}"
+            )
+        marker_cols = marker_data_columns(marker_df)
+        marker_df = marker_df[['condition', 'sec'] + marker_cols]
+        marker_df.sort_values(by='sec', inplace=True)
+        marker_df.reset_index(drop=True, inplace=True)
+
     br_glob = glob_wrapper(condition, 'summary')
     br_list = get_file_list(data_dir, br_glob, sbj=subject)
     br_dfs = [
@@ -594,6 +669,7 @@ def load_and_sync_xsens(subject, condition='M', data_dir=SEAT_DATA_DIR):
                   'imu': imu_df,
                   'pss': pss_df,
                   'ecg': ecg_df,
+                  'marker': marker_df,
                   'br': br_df}
 
     return xsens_dict

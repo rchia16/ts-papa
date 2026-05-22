@@ -117,24 +117,29 @@ def signal_processing(sbj_processed_dir: str, sbj_dicts: list, fs=IMU_FS,
             imu_df = sbj_dict['imu']
             pss_df = sbj_dict['pss']
             ecg_df = sbj_dict.get('ecg')
+            marker_df = sbj_dict.get('marker')
             br_df = sbj_dict['br']
 
             data = prepare_multimodal(
                 imu_df,
                 pss_df,
                 ecg_df=ecg_df,
+                marker_df=marker_df,
                 window_size=window_size,
                 window_shift=window_shift,
             )
             if data is None:
                 continue
 
-            if len(data) == 5:
-                imu_filt, pss_filt, pss_freqs, pss_time, conds_wins = data
-                ecg_filt, ecg_time = None, None
-            else:
-                imu_filt, pss_filt, pss_freqs, pss_time, \
-                        conds_wins, ecg_filt, ecg_time = data
+            imu_filt, pss_filt, pss_freqs, pss_time, conds_wins = data[:5]
+            rest = list(data[5:])
+            ecg_filt, ecg_time = None, None
+            marker_filt, marker_time, marker_columns = None, None, None
+            if ecg_df is not None and len(rest) >= 2:
+                ecg_filt, ecg_time = rest[:2]
+                rest = rest[2:]
+            if len(rest) >= 3:
+                marker_filt, marker_time, marker_columns = rest[:3]
 
             imu_filt_list = [arr[..., 1:] for arr in imu_filt]
             acc_filt_list = [arr[..., :3] for arr in imu_filt_list]
@@ -177,11 +182,14 @@ def signal_processing(sbj_processed_dir: str, sbj_dicts: list, fs=IMU_FS,
             sbj_processed['pss_filt'] = pss_filt
             sbj_processed['pss_freqs'] = pss_freqs
             sbj_processed['ecg_filt'] = ecg_filt
+            sbj_processed['marker_filt'] = marker_filt
             sbj_processed['br'] = br
             sbj_processed['conds'] = conds_wins
             sbj_processed['imu_time'] = imu_time
             sbj_processed['pss_time'] = pss_time
             sbj_processed['ecg_time'] = ecg_time
+            sbj_processed['marker_time'] = marker_time
+            sbj_processed['marker_columns'] = marker_columns
             sbj_processed['br_time'] = br_time
 
             with open(sbj_fname, 'wb') as f:
