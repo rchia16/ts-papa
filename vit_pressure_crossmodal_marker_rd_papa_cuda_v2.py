@@ -1521,6 +1521,11 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         "gate_meta": gate_meta,
         "main_prediction_uses_target_marker": False,
         "marker_role": "source marker supervises an IMU/RR-derived motion/posture proxy and reliability gate; target marker is ignored outside oracle audit",
+        "mard_cuda_device": str(getattr(args, "mard_cuda_device", "auto")),
+        "mard_ridge_backend": str(getattr(args, "mard_ridge_backend", "torch")),
+        "mard_gate_backend": str(getattr(args, "mard_gate_backend", "torch")),
+        "mard_expert_classifier": str(getattr(args, "mard_expert_classifier", "torch_logreg")),
+        "mard_tf32_enabled": bool(getattr(args, "mard_enable_tf32", True)),
     })
     with open(out / "marker_rd_feature_meta.json", "w") as f:
         json.dump(feature_meta, f, indent=2)
@@ -1650,6 +1655,8 @@ def add_marker_rd_args(parser) -> None:
     parser.add_argument("--mard-no-pin-memory", dest="mard_pin_memory", action="store_false")
     parser.add_argument("--mard-persistent-workers", dest="mard_persistent_workers", action="store_true", default=True)
     parser.add_argument("--mard-no-persistent-workers", dest="mard_persistent_workers", action="store_false")
+    parser.add_argument("--mard-enable-tf32", dest="mard_enable_tf32", action="store_true", default=True, help="Enable TF32 matmul/cuDNN for CUDA post-hoc torch components.")
+    parser.add_argument("--mard-disable-tf32", dest="mard_enable_tf32", action="store_false", help="Disable TF32 matmul/cuDNN for stricter reproducibility.")
 
     parser.add_argument("--imu-fs", type=float, default=float(IMU_FS))
     parser.add_argument("--marker-fs", type=float, default=float(MARKER_FS))
@@ -1734,6 +1741,22 @@ def finalize_args_marker_rd(args) -> None:
         args.mard_min_marker_rows = 50
     if getattr(args, "mard_gate_temperature", None) is None:
         args.mard_gate_temperature = 0.75
+
+    # CRA-CUDA style speed controls for Ampere+ GPUs. This only affects torch/CUDA
+    # operations; sklearn fallbacks are unchanged.
+    if torch.cuda.is_available():
+        enable_tf32 = bool(getattr(args, "mard_enable_tf32", True))
+        try:
+            torch.set_float32_matmul_precision("high" if enable_tf32 else "highest")
+        except Exception:
+            pass
+        torch.backends.cuda.matmul.allow_tf32 = enable_tf32
+        torch.backends.cudnn.allow_tf32 = enable_tf32
+
+    # If the launcher passes --device cuda:N and leaves --mard-cuda-device auto,
+    # bind post-hoc torch ridge/logreg/gate work to that same GPU.
+    if str(getattr(args, "mard_cuda_device", "auto")).lower() == "auto":
+        args.mard_cuda_device = str(getattr(args, "device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     mode = str(getattr(args, "marker_mode", "quality_gate"))
     if mode in {"teacher_motion_state", "posture_profile_expert", "shuffled_teacher_control", "time_shift_control", "time_only_control"}:
