@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from scipy.interpolate import interp1d, CubicSpline
-from scipy.signal import butter, sosfilt, decimate, stft
+from scipy.signal import butter, sosfilt, decimate, stft, iirnotch, filtfilt
 from scipy.signal import convolve, find_peaks
 from scipy.signal.windows import hann, triang, exponential
 from scipy.ndimage import uniform_filter1d, median_filter
@@ -399,6 +399,29 @@ def pressure_signal_processing(pressure_data, fs=BR_FS):
 
     # bandpass filter the lbls
     bp_data = butter_bandpass_filter(data_ma, 4/60, 70/60, fs=fs, order=2)
+
+    if flag:
+        bp_data = np.squeeze(bp_data)
+
+    return bp_data
+
+def ecg_signal_processing(ecg_data, fs=250):
+    '''Run ECG signal through standard preprocessing steps:
+          * Standard scaling
+          * 50 Hz notch filter for line-noise suppression
+          * Bandpass filter at 0.5-100 Hz (4th order Butterworth)'''
+    flag = False
+    if ecg_data.ndim == 1:
+        ecg_data = ecg_data.reshape(-1, 1)
+        flag = True
+
+    data_sd = StandardScaler().fit_transform(ecg_data.astype(float))
+    b_notch, a_notch = iirnotch(w0=50.0, Q=30.0, fs=fs)
+    ecg_notch = filtfilt(b_notch, a_notch, data_sd, axis=0)
+
+    nyq = 0.5 * fs
+    highcut = min(100.0, 0.95 * nyq)
+    bp_data = butter_bandpass_filter(ecg_notch, 0.5, highcut, fs=fs, order=4)
 
     if flag:
         bp_data = np.squeeze(bp_data)

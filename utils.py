@@ -16,13 +16,14 @@ from sklearn.model_selection import train_test_split
 from datapipeline import load_and_snip, get_windowed_data, get_file_list
 from digitalsignalprocessing import vectorized_slide_win as vsw
 from digitalsignalprocessing import (
-    imu_signal_processing, pressure_signal_processing, get_max_freq
+    imu_signal_processing, pressure_signal_processing, ecg_signal_processing,
+    get_max_freq
 )
 
 from tsfresh.feature_selection import relevance as tsfresh_relevance
 from tsfresh.utilities.string_manipulation import get_config_from_string
 
-from config import WINDOW_SIZE, WINDOW_SHIFT, IMU_FS, PSS_FS
+from config import WINDOW_SIZE, WINDOW_SHIFT, IMU_FS, PSS_FS, ECG_FS
 from config import IMU_FS, DATA_DIR, SEAT_DATA_DIR
 
 def reshape_array(data):
@@ -359,7 +360,10 @@ def sync_df(df, time_tuple):
 
     return df[mask].reset_index(drop=True).copy()
 
-def prepare_imu_pss(imu_df, pss_df, window_size=30, window_shift=15):
+# def prepare_multimodal(
+def prepare_multimodal(
+    imu_df, pss_df, ecg_df=None, window_size=30, window_shift=15
+):
     imu_sec = imu_df['sec']
     pss_sec = pss_df['sec']
     wins = vsw(np.arange(len(imu_sec)), len(imu_sec),
@@ -370,8 +374,10 @@ def prepare_imu_pss(imu_df, pss_df, window_size=30, window_shift=15):
     # there there were any leaps in imu seconds or pss seconds, skip
     thold = 60 # seconds
     pss_win_size = int(window_size * PSS_FS)
+    ecg_win_size = int(window_size * ECG_FS) if ecg_df is not None else None
+    ecg_sec = ecg_df['sec'] if ecg_df is not None else None
 
-    imu_wins, pss_wins = [], []
+    imu_wins, pss_wins, ecg_wins = [], [], []
     for win in wins:
         if win[-1] == 0: break
         imu_win = imu_df.iloc[win]
@@ -379,6 +385,11 @@ def prepare_imu_pss(imu_df, pss_df, window_size=30, window_shift=15):
         diff = np.abs(pss_sec - imu_win['sec'].iloc[0])
         idx = diff.argmin()
         pss_win = pss_df.iloc[idx:idx+pss_win_size]
+        ecg_win = None
+        if ecg_df is not None:
+            ecg_diff = np.abs(ecg_sec - imu_win['sec'].iloc[0])
+            ecg_idx = ecg_diff.argmin()
+            ecg_win = ecg_df.iloc[ecg_idx:ecg_idx+ecg_win_size]
 
         imu_sec0 = datetime.fromtimestamp(imu_win['sec'].iloc[0])
         pss_sec0 = datetime.fromtimestamp(pss_win['sec'].iloc[0])
@@ -390,6 +401,8 @@ def prepare_imu_pss(imu_df, pss_df, window_size=30, window_shift=15):
         # else:
         imu_wins.append(imu_win)
         pss_wins.append(pss_win)
+        if ecg_df is not None:
+            ecg_wins.append(ecg_win)
 
     if len(imu_wins) == 0 or len(pss_wins) == 0:
         return
@@ -413,11 +426,21 @@ def prepare_imu_pss(imu_df, pss_df, window_size=30, window_shift=15):
         )
 
     pss_time = [pwin['sec'].values for pwin in pss_wins]
+    ecg_time = [ewin['sec'].values for ewin in ecg_wins] if ecg_df is not None else None
 
     freq_func = partial(get_max_freq, fs=PSS_FS)
     with Pool(cpu_count()//2) as p:
         pss_freqs = p.map(freq_func, pss_filt)
     # pss_freqs = [freq_func(pss) for pss in pss_filt]
+
+    ecg_filt = None
+    if ecg_df is not None:
+        ecg_func = partial(ecg_signal_processing, fs=ECG_FS)
+        with Pool(cpu_count()//2) as p:
+            ecg_filt = p.map(
+                ecg_func,
+                map(lambda ewin: ewin['ecg'].values, ecg_wins)
+            )
 
     # double check if there are any fractured samples
     if not isinstance(imu_filt, np.ndarray) and \
@@ -429,9 +452,14 @@ def prepare_imu_pss(imu_df, pss_df, window_size=30, window_shift=15):
         pss_win_len = window_size*PSS_FS
         pss_idxs = [i for i, data in enumerate(pss_filt) if
                            len(data)!=pss_win_len]
+        ecg_idxs = []
+        if ecg_filt is not None:
+            ecg_win_len = window_size*ECG_FS
+            ecg_idxs = [i for i, data in enumerate(ecg_filt) if
+                               len(data)!=ecg_win_len]
 
         # filter out any that do not meet time requirement
-        idxs_reject = np.unique([imu_idxs+pss_idxs])
+        idxs_reject = np.unique([imu_idxs+pss_idxs+ecg_idxs])
         idxs_to_keep = [i for i in range(len(imu_filt)) if i not in
                         idxs_reject]
         imu_filt = [data for i, data in enumerate(imu_filt) if i in idxs_to_keep]
@@ -441,6 +469,9 @@ def prepare_imu_pss(imu_df, pss_df, window_size=30, window_shift=15):
         pss_freqs = np.array(
             [data for i, data in enumerate(pss_freqs) if i in idxs_to_keep]
         )
+        if ecg_filt is not None:
+            ecg_filt = [data for i, data in enumerate(ecg_filt) if i in idxs_to_keep]
+            ecg_time = [data for i, data in enumerate(ecg_time) if i in idxs_to_keep]
         conds_wins = [data for i, data in enumerate(conds_wins) if i in idxs_to_keep]
 
     if not isinstance(imu_filt, np.ndarray):
@@ -453,15 +484,22 @@ def prepare_imu_pss(imu_df, pss_df, window_size=30, window_shift=15):
 
     if not isinstance(pss_time, np.ndarray):
         pss_time = np.array(pss_time)
+    if ecg_filt is not None and not isinstance(ecg_filt, np.ndarray):
+        ecg_filt = np.array(ecg_filt)
+    if ecg_time is not None and not isinstance(ecg_time, np.ndarray):
+        ecg_time = np.array(ecg_time)
 
     if len(conds_wins) != len(pss_freqs):
         ipdb.set_trace()
 
-    return imu_filt, pss_filt, pss_freqs, pss_time, conds_wins
+    if ecg_filt is None:
+        return imu_filt, pss_filt, pss_freqs, pss_time, conds_wins
+    return imu_filt, pss_filt, pss_freqs, pss_time, conds_wins, ecg_filt, ecg_time
 
 def attach_condition_to_df(fname, df):
     file_condition = fname.split(sep)[-1].split('_')[0]
-    df.insert(0, 'condition', file_condition)
+    if 'condition' not in df.columns.values:
+        df.insert(0, 'condition', file_condition)
     return df
 
 def load_and_sync_xsens(subject, condition='M', data_dir=SEAT_DATA_DIR):
@@ -515,6 +553,33 @@ def load_and_sync_xsens(subject, condition='M', data_dir=SEAT_DATA_DIR):
     pss_df.sort_values(by='sec', inplace=True)
     pss_df.reset_index(drop=True, inplace=True)
 
+    ecg_glob = glob_wrapper(condition, 'ecg')
+    ecg_list = get_file_list(data_dir, ecg_glob, sbj=subject)
+    if len(ecg_list) == 0:
+        ecg_list = get_file_list(data_dir, f'*{condition}_ecg_df*',
+                                 sbj=subject)
+    ecg_df = None
+    if len(ecg_list) > 0:
+        ecg_dfs = [
+            attach_condition_to_df(fname, pd.read_csv(fname)) for fname in ecg_list
+        ]
+        ecg_df = pd.concat(ecg_dfs, axis=0)
+        ecg_waveform_cols = [col for col in ecg_df.columns.values
+                             if 'ecg' in col.lower()]
+        if len(ecg_waveform_cols) > 0:
+            ecg_col = ecg_waveform_cols[0]
+        else:
+            ecg_col = ecg_df.columns.values[-1]
+        if not pd.api.types.is_numeric_dtype(ecg_df[ecg_col]):
+            raise ValueError(
+                f"ECG column '{ecg_col}' is not numeric for subject={subject}, "
+                f"condition={condition}"
+            )
+        ecg_df = ecg_df[['condition', 'sec', ecg_col]]
+        ecg_df = ecg_df.rename(columns={ecg_col: 'ecg'})
+        ecg_df.sort_values(by='sec', inplace=True)
+        ecg_df.reset_index(drop=True, inplace=True)
+
     br_glob = glob_wrapper(condition, 'summary')
     br_list = get_file_list(data_dir, br_glob, sbj=subject)
     br_dfs = [
@@ -528,6 +593,7 @@ def load_and_sync_xsens(subject, condition='M', data_dir=SEAT_DATA_DIR):
     xsens_dict = {'subject': subject,
                   'imu': imu_df,
                   'pss': pss_df,
+                  'ecg': ecg_df,
                   'br': br_df}
 
     return xsens_dict
@@ -874,5 +940,3 @@ def _filter_subjects_with_data(
         print(f"[DATA] Skipping subjects with missing data: {', '.join(skipped_missing)}")
 
     return filtered
-
-

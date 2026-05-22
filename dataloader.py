@@ -309,6 +309,7 @@ def make_dataset(
     label_encoder_dir: Optional[str] = None,
     data_group: Optional[str] = None,
     include_tlx: bool = False,
+    include_ecg: bool = False,
     tlx_csv_path: Optional[str] = None,
     tlx_table: Optional[dict] = None,
 ):
@@ -317,7 +318,8 @@ def make_dataset(
             f"make_dataset received no subject arrays for data_str={data_str}. "
             "This usually means the LOSO train cohort is empty."
         )
-    le = label_encoder or _load_label_encoder(label_encoder_dir, data_group=data_group)
+    le = label_encoder or _load_label_encoder(
+        label_encoder_dir, data_group=data_group)
 
     x = np.concatenate(
         [data[data_str] for data in data_list], axis=0
@@ -325,6 +327,15 @@ def make_dataset(
     pss = np.concatenate(
         [data['pss_filt'] for data in data_list], axis=0
     )
+    ecg = None
+    if include_ecg:
+        ecg_parts = [data.get('ecg_filt') for data in data_list]
+        if any(part is None for part in ecg_parts):
+            raise ValueError(
+                "include_ecg=True but at least one subject is missing 'ecg_filt'. "
+                "Re-run preprocessing for those subjects or disable include_ecg."
+            )
+        ecg = np.concatenate(ecg_parts, axis=0)
     br = np.concatenate(
         [data['br'] for data in data_list], axis=0
     )
@@ -358,18 +369,24 @@ def make_dataset(
         ]
         x = x[idxs]
         pss = pss[idxs]
+        if ecg is not None:
+            ecg = ecg[idxs]
         br = br[idxs]
         cond = cond[idxs]
         if tlx is not None:
             tlx = tlx[idxs]
 
+    if include_tlx and include_ecg:
+        return x, pss, br, cond, tlx, ecg
     if include_tlx:
         return x, pss, br, cond, tlx
+    if include_ecg:
+        return x, pss, br, cond, ecg
     return x, pss, br, cond
 
 # Load data to dataloader
 class LoadDataset(Dataset):
-    def __init__(self, x, y=None, cond=None, br=None, tlx=None, aug_ratio=0.3, preserve_layout: bool = False):
+    def __init__(self, x, y=None, cond=None, br=None, tlx=None, ecg=None, aug_ratio=0.3, preserve_layout: bool = False):
         self.len = len(x)
         self.preserve_layout = bool(preserve_layout)
         if isinstance(x, np.ndarray):
@@ -409,6 +426,13 @@ class LoadDataset(Dataset):
         else:
             self.tlx = tlx
 
+        if ecg is not None and isinstance(ecg, np.ndarray):
+            self.ecg = torch.from_numpy(ecg).float()
+        elif ecg is not None and not isinstance(ecg, np.ndarray):
+            self.ecg = ecg.float()
+        else:
+            self.ecg = ecg
+
         if aug_ratio > 0:
             if self.preserve_layout:
                 raise ValueError("Augmentation is not supported when preserve_layout=True.")
@@ -444,6 +468,12 @@ class LoadDataset(Dataset):
 
     def __getitem__(self, index):
         if self.y is not None and self.cond is not None \
+                and self.br is not None and self.tlx is not None and self.ecg is not None:
+            return self.x[index], self.y[index], self.cond[index], self.br[index], self.tlx[index], self.ecg[index]
+        elif self.y is not None and self.cond is not None \
+                and self.br is not None and self.ecg is not None:
+            return self.x[index], self.y[index], self.cond[index], self.br[index], self.ecg[index]
+        elif self.y is not None and self.cond is not None \
                 and self.br is not None and self.tlx is not None:
             return self.x[index], self.y[index], self.cond[index], self.br[index], self.tlx[index]
         elif self.y is not None and self.cond is not None \
@@ -484,6 +514,7 @@ def build_loocv_loaders(
     label_encoder_dir: Optional[str] = None,
     data_group: Optional[str] = None,
     include_tlx: bool = False,
+    include_ecg: bool = False,
     tlx_csv_path: Optional[str] = None,
 ):
     def _call_subject_loader(loader_fn, subject_name: str):
@@ -501,6 +532,7 @@ def build_loocv_loaders(
         label_encoder_dir=(label_encoder_dir or data_dir),
         data_group=data_group,
         include_tlx=include_tlx,
+        include_ecg=include_ecg,
         tlx_csv_path=tlx_csv_path,
     )
     test_out = dataset_builder(
@@ -508,16 +540,25 @@ def build_loocv_loaders(
         label_encoder_dir=(label_encoder_dir or data_dir),
         data_group=data_group,
         include_tlx=include_tlx,
+        include_ecg=include_ecg,
         tlx_csv_path=tlx_csv_path,
     )
-    if include_tlx:
+    if include_tlx and include_ecg:
+        x_train, y_train, br_train, cond_train, tlx_train, ecg_train = train_out
+        x_test,  y_test,  br_test,  cond_test,  tlx_test,  ecg_test = test_out
+    elif include_tlx:
         x_train, y_train, br_train, cond_train, tlx_train = train_out
         x_test,  y_test,  br_test,  cond_test,  tlx_test  = test_out
+        ecg_train, ecg_test = None, None
+    elif include_ecg:
+        x_train, y_train, br_train, cond_train, ecg_train = train_out
+        x_test,  y_test,  br_test,  cond_test,  ecg_test  = test_out
+        tlx_train, tlx_test = None, None
     else:
         x_train, y_train, br_train, cond_train = train_out
         x_test,  y_test,  br_test,  cond_test  = test_out
-        tlx_train = None
-        tlx_test = None
+        tlx_train, tlx_test = None, None
+        ecg_train, ecg_test = None, None
 
     if autoencoder is not None:
         prefix = f'{sbj}_{data_str}_'
@@ -539,6 +580,8 @@ def build_loocv_loaders(
     br_val = br_train[val_idxs]
     if include_tlx:
         tlx_val = tlx_train[val_idxs]
+    if include_ecg:
+        ecg_val = ecg_train[val_idxs]
 
     x_train = x_train[train_idxs]
     y_train = y_train[train_idxs]
@@ -546,11 +589,21 @@ def build_loocv_loaders(
     br_train = br_train[train_idxs]
     if include_tlx:
         tlx_train = tlx_train[train_idxs]
+    if include_ecg:
+        ecg_train = ecg_train[train_idxs]
 
-    if include_tlx:
+    if include_tlx and include_ecg:
+        train_data_to_load = (x_train, y_train, cond_train, br_train, tlx_train, ecg_train)
+        val_data_to_load   = (x_val, y_val, cond_val, br_val, tlx_val, ecg_val)
+        test_data_to_load  = (x_test, y_test, cond_test, br_test, tlx_test, ecg_test)
+    elif include_tlx:
         train_data_to_load = (x_train, y_train, cond_train, br_train, tlx_train)
         val_data_to_load   = (x_val, y_val, cond_val, br_val, tlx_val)
         test_data_to_load  = (x_test, y_test, cond_test, br_test, tlx_test)
+    elif include_ecg:
+        train_data_to_load = (x_train, y_train, cond_train, br_train, ecg_train)
+        val_data_to_load   = (x_val, y_val, cond_val, br_val, ecg_val)
+        test_data_to_load  = (x_test, y_test, cond_test, br_test, ecg_test)
     else:
         train_data_to_load = (x_train, y_train, cond_train, br_train)
         val_data_to_load   = (x_val, y_val, cond_val, br_val)
@@ -592,6 +645,7 @@ def loocv_generator(
     autoencoder=None,
     data_group: Optional[str] = None,
     include_tlx: bool = False,
+    include_ecg: bool = False,
     tlx_csv_path: Optional[str] = None,
 ):
     for sbj in subjects:
@@ -608,6 +662,7 @@ def loocv_generator(
             autoencoder=autoencoder,
             data_group=data_group,
             include_tlx=include_tlx,
+            include_ecg=include_ecg,
             tlx_csv_path=tlx_csv_path,
         )
 
@@ -677,4 +732,3 @@ def make_fewshot_loader_from_test(
         **_loader_kwargs(),
     )
     return fewshot_loader, remaining_loader
-
