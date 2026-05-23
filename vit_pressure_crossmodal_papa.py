@@ -968,7 +968,7 @@ def main() -> None:
     parser.add_argument(
         "--embed-classifier",
         default="lda",
-        choices=["lda", "logreg", "linear"],
+        choices=["lda", "logreg", "linear_probe"],
     )
     parser.add_argument(
         "--embed-pooling",
@@ -1066,4 +1066,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

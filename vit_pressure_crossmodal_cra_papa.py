@@ -1305,7 +1305,7 @@ def add_common_downstream_args(parser) -> None:
     parser.add_argument("--tlx-ridge-alpha", type=float, default=1.0)
     parser.add_argument("--embed-data-group", default=None, choices=["mr", "level", "levels", "mr_levels"])
     parser.add_argument("--embed-labels", default="L0,L2,L3")
-    parser.add_argument("--embed-classifier", default="linear", choices=["lda", "logreg", "linear"])
+    parser.add_argument("--embed-classifier", default="linear_probe", choices=["lda", "logreg", "linear_probe"])
     parser.add_argument("--embed-pooling", default="rich", choices=["mean", "max", "cls_last", "mean_std", "mean_std_max", "rich"])
     parser.add_argument("--embed-stft-profile", action="store_true")
     parser.add_argument("--embed-batch-size", type=int, default=128)

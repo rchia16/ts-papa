@@ -100,7 +100,7 @@ COMMON_ARGS=(
 
     --resp-dyn-also-frozen
     --eval-frozen-embeddings
-    --embed-classifier linear
+    --embed-classifier linear_probe
     --embed-pooling rich
     --embed-stft-profile
     --linear-probe-epochs 30

@@ -989,7 +989,7 @@ def _fit_ridge_predict_torch(
 
 
 class TorchLogRegClassifier:
-    """Small sklearn-like multinomial logistic regression trained in torch."""
+    """Small sklearn-like multinomial linear probe trained in torch."""
 
     def __init__(
         self,
@@ -1247,16 +1247,53 @@ def fit_marker_quality_state_proxy(
         return zeros_tr, high_unc_tr, zeros_te, high_unc_te, meta
 
     alpha = float(getattr(args, "mard_marker_proxy_alpha", 10.0))
-    y_scaler = StandardScaler().fit(y_state[valid])
-    y_z = y_scaler.transform(y_state[valid]).astype(np.float32)
+    is_full_state = y_state.shape[1] >= len(QUALITY_STATE_NAMES) + len(QUALITY_STATE_CLASS_NAMES)
+    cont_dim = len(QUALITY_STATE_NAMES)
+    y_cont = y_state[:, :cont_dim]
+    y_class = np.argmax(y_state[:, cont_dim : cont_dim + len(QUALITY_STATE_CLASS_NAMES)], axis=1).astype(int) if is_full_state else None
+    y_scaler = StandardScaler().fit(y_cont[valid])
+    y_z = y_scaler.transform(y_cont[valid]).astype(np.float32)
+
+    def _align_state_proba(proba: np.ndarray, classes: np.ndarray) -> np.ndarray:
+        out = np.zeros((proba.shape[0], len(QUALITY_STATE_CLASS_NAMES)), dtype=np.float32)
+        cls_to_i = {int(c): i for i, c in enumerate(range(len(QUALITY_STATE_CLASS_NAMES)))}
+        for j, c in enumerate(np.asarray(classes, dtype=int)):
+            if int(c) in cls_to_i:
+                out[:, cls_to_i[int(c)]] = proba[:, j]
+        row_sum = out.sum(axis=1, keepdims=True)
+        missing = row_sum.reshape(-1) <= 1e-8
+        if np.any(missing):
+            out[missing, :] = 1.0 / len(QUALITY_STATE_CLASS_NAMES)
+            row_sum = out.sum(axis=1, keepdims=True)
+        return (out / row_sum.clip(min=1e-8)).astype(np.float32)
+
+    def _fit_predict_state_classifier(tr_mask: np.ndarray, xp: np.ndarray) -> np.ndarray:
+        if y_class is None:
+            return np.zeros((xp.shape[0], 0), dtype=np.float32)
+        clf = TorchLogRegClassifier(
+            C=float(getattr(args, "mard_logreg_c", 1.0)),
+            max_iter=int(getattr(args, "mard_torch_clf_epochs", 200)),
+            lr=float(getattr(args, "mard_torch_clf_lr", 1e-2)),
+            batch_size=int(getattr(args, "mard_torch_clf_batch_size", 4096)),
+            weight_decay=float(getattr(args, "mard_torch_clf_weight_decay", 0.0)),
+            device=str(_cuda_device_from_args(args)),
+            seed=int(getattr(args, "seed", 42)),
+            class_weight_balanced=True,
+        )
+        clf.fit(x_ar_train[tr_mask], y_class[tr_mask])
+        return _align_state_proba(clf.predict_proba(xp), clf.classes_)
 
     def fit_predict(tr_mask: np.ndarray, xp: np.ndarray) -> np.ndarray:
-        yz = y_scaler.transform(y_state[tr_mask]).astype(np.float32)
+        yz = y_scaler.transform(y_cont[tr_mask]).astype(np.float32)
         pred_z = _fit_ridge_predict(x_ar_train[tr_mask], yz, xp, alpha, args=args)
-        return np.clip(y_scaler.inverse_transform(pred_z), 0.0, 1.0).astype(np.float32)
+        cont = np.clip(y_scaler.inverse_transform(pred_z), 0.0, 1.0).astype(np.float32)
+        if not is_full_state:
+            return cont
+        cls_prob = _fit_predict_state_classifier(tr_mask, xp)
+        return np.concatenate([cont, cls_prob], axis=1).astype(np.float32)
 
-    pred_test = np.clip(y_scaler.inverse_transform(_fit_ridge_predict(x_ar_train[valid], y_z, x_ar_test, alpha, args=args)), 0.0, 1.0).astype(np.float32)
-    pred_train_full = np.clip(y_scaler.inverse_transform(_fit_ridge_predict(x_ar_train[valid], y_z, x_ar_train, alpha, args=args)), 0.0, 1.0).astype(np.float32)
+    pred_test = fit_predict(valid, x_ar_test)
+    pred_train_full = fit_predict(valid, x_ar_train)
     pred_train = pred_train_full.copy()
     if source_mode == "observed":
         pred_train[valid] = y_state[valid]
@@ -1298,6 +1335,7 @@ def fit_marker_quality_state_proxy(
         "marker_proxy_resid_scale": float(resid_scale),
         "quality_state_proxy_available": True,
         "quality_state_proxy_source_mode": source_mode,
+        "quality_state_discrete_backend": "torch_logreg" if is_full_state else "none",
     }
     return pred_train.astype(np.float32), unc_train, pred_test.astype(np.float32), unc_test, meta
 
@@ -1530,7 +1568,7 @@ class SafeProbClassifier:
                 self.model = make_pipeline(StandardScaler(), clf)
                 self.model.fit(x, y)
                 self.classes_ = np.asarray(self.model[-1].classes_, dtype=int)
-            elif self.kind in {"torch_logreg", "cuda_logreg", "gpu_logreg"}:
+            elif self.kind in {"torch_logreg", "cuda_logreg", "gpu_logreg", "linear_probe", "torch_linear_probe", "cuda_linear_probe"}:
                 self.model = TorchLogRegClassifier(
                     C=self.C,
                     max_iter=int(getattr(self.args, "mard_torch_clf_epochs", self.max_iter)),
@@ -1702,6 +1740,62 @@ def quality_state_reliability(quality_state: np.ndarray, quality_unc: np.ndarray
     return np.clip(np.nan_to_num(rel, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0).astype(np.float32)
 
 
+def quality_state_class_from_scores(state: np.ndarray, valid: Optional[np.ndarray] = None) -> np.ndarray:
+    arr = np.asarray(state, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    n = arr.shape[0]
+    if arr.shape[1] >= len(QUALITY_STATE_NAMES) + len(QUALITY_STATE_CLASS_NAMES):
+        return np.argmax(arr[:, len(QUALITY_STATE_NAMES) : len(QUALITY_STATE_NAMES) + len(QUALITY_STATE_CLASS_NAMES)], axis=1).astype(int)
+    if arr.shape[1] < len(QUALITY_STATE_NAMES):
+        pad = np.zeros((n, len(QUALITY_STATE_NAMES) - arr.shape[1]), dtype=np.float32)
+        arr = np.concatenate([arr, pad], axis=1)
+    cls = np.full(n, 4, dtype=int)
+    row_valid = np.ones(n, dtype=bool) if valid is None else np.asarray(valid, dtype=bool).reshape(-1)
+    clean = arr[:, 0]
+    motion_contam = arr[:, 1]
+    posture_shift = arr[:, 2]
+    rot_instability = arr[:, 3]
+    trans_instability = arr[:, 4]
+    stable = row_valid & (clean >= 0.50) & (motion_contam < 0.50) & (posture_shift < 0.50)
+    posture = row_valid & ~stable & (posture_shift >= np.maximum(rot_instability, trans_instability))
+    trans = row_valid & ~stable & ~posture & (trans_instability >= rot_instability)
+    rot = row_valid & ~stable & ~posture & ~trans
+    cls[stable] = 0
+    cls[trans] = 1
+    cls[rot] = 2
+    cls[posture] = 3
+    return cls
+
+
+def quality_state_prediction_metrics(pred_state: np.ndarray, oracle_state: np.ndarray, valid: np.ndarray) -> Dict[str, float]:
+    pred = np.asarray(pred_state, dtype=np.float32)
+    oracle = np.asarray(oracle_state, dtype=np.float32)
+    mask = np.asarray(valid, dtype=bool).reshape(-1)
+    if pred.shape[0] != oracle.shape[0]:
+        raise ValueError("pred_state and oracle_state must have the same number of rows")
+    d = min(len(QUALITY_STATE_NAMES), pred.shape[1], oracle.shape[1])
+    out: Dict[str, float] = {"quality_state_proxy_valid_rows": int(mask.sum())}
+    if int(mask.sum()) == 0 or d == 0:
+        for name in QUALITY_STATE_NAMES[:d]:
+            out[f"{name}_rmse"] = float("nan")
+        out["quality_state_mean_rmse"] = float("nan")
+        out["motion_state_bal_acc"] = float("nan")
+        return out
+    rmses = []
+    for i, name in enumerate(QUALITY_STATE_NAMES[:d]):
+        rmse = float(np.sqrt(np.nanmean((pred[mask, i] - oracle[mask, i]) ** 2)))
+        out[f"{name}_rmse"] = rmse
+        rmses.append(rmse)
+    out["quality_state_mean_rmse"] = float(np.nanmean(rmses)) if rmses else float("nan")
+    pred_cls = quality_state_class_from_scores(pred, valid=np.ones(pred.shape[0], dtype=bool))
+    oracle_cls = quality_state_class_from_scores(oracle, valid=mask)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out["motion_state_bal_acc"] = float(balanced_accuracy_score(oracle_cls[mask], pred_cls[mask])) if len(np.unique(oracle_cls[mask])) > 1 else float("nan")
+    return out
+
+
 def safe_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, classes_train: np.ndarray, prefix: str) -> Dict[str, float]:
     y_true = np.asarray(y_true, dtype=int)
     y_pred = np.asarray(y_pred, dtype=int)
@@ -1761,6 +1855,20 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
 
     out = sbj_dir / "marker_rd_papa"
     out.mkdir(parents=True, exist_ok=True)
+    oracle_state, oracle_state_valid, oracle_state_meta = marker_quality_state_targets(
+        marker_features=test_pack["x_marker"],
+        marker_valid=test_pack["marker_valid"],
+        subject_ids=np.asarray(test_pack.get("subject_ids", np.full(len(y_test), sbj, dtype=object)), dtype=object),
+        args=args,
+    )
+    proxy_metric_row: Dict[str, Any] = {
+        "__summary_name__": "marker_quality_state_proxy_metrics",
+        "subject": sbj,
+        "tag": "marker_quality_state_proxy",
+        "target_marker_valid_rate": float(np.mean(test_pack["marker_valid"])),
+        "oracle_quality_state_valid_rows": int(np.sum(oracle_state_valid)),
+    }
+    proxy_metric_row.update(quality_state_prediction_metrics(quality["quality_state_test"], oracle_state, oracle_state_valid))
     trace: Dict[str, Any] = {
         "subject_id": test_pack.get("subject_ids", np.asarray([sbj] * len(y_test), dtype=object)).astype(str),
         "window_idx": np.arange(len(y_test), dtype=int),
@@ -1787,6 +1895,32 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         trace[f"conf_{name}"] = conf_by_expert[name]
     pd.DataFrame(trace).to_csv(out / "marker_rd_preference_trace.csv", index=False)
     pd.DataFrame({"y_true": y_test.astype(int), "y_pred": y_pred.astype(int), "final_conf": final_conf}).to_csv(out / "marker_rd_predictions.csv", index=False)
+    quality_trace: Dict[str, Any] = {
+        "window_idx": np.arange(len(y_test), dtype=int),
+        "y_true": y_test.astype(int),
+        "y_pred": y_pred.astype(int),
+        "clean_score_hat": quality["quality_state_test"][:, 0] if quality["quality_state_test"].shape[1] > 0 else np.nan,
+        "motion_contam_score_hat": quality["quality_state_test"][:, 1] if quality["quality_state_test"].shape[1] > 1 else np.nan,
+        "posture_shift_score_hat": quality["quality_state_test"][:, 2] if quality["quality_state_test"].shape[1] > 2 else np.nan,
+        "rotation_instability_hat": quality["quality_state_test"][:, 3] if quality["quality_state_test"].shape[1] > 3 else np.nan,
+        "translation_instability_hat": quality["quality_state_test"][:, 4] if quality["quality_state_test"].shape[1] > 4 else np.nan,
+        "quality_state_uncertainty": quality["quality_state_unc_test"].reshape(-1),
+        "target_marker_available": test_pack["marker_valid"].astype(int),
+    }
+    oracle_cols = [
+        "oracle_clean_score",
+        "oracle_motion_contam",
+        "oracle_posture_shift",
+        "oracle_rotation_instability",
+        "oracle_translation_instability",
+        "oracle_marker_validity",
+    ]
+    for i, name in enumerate(oracle_cols):
+        if i < oracle_state.shape[1]:
+            vals = np.full(len(y_test), np.nan, dtype=np.float32)
+            vals[oracle_state_valid] = oracle_state[oracle_state_valid, i]
+            quality_trace[name] = vals
+    pd.DataFrame(quality_trace).to_csv(out / "marker_quality_state_trace.csv", index=False)
     q_diag = {
         "subject_id": test_pack.get("subject_ids", np.asarray([sbj] * len(y_test), dtype=object)).astype(str),
         "window_idx": np.arange(len(y_test), dtype=int),
@@ -1798,6 +1932,21 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         if i < quality["quality_state_test"].shape[1]:
             q_diag[name] = quality["quality_state_test"][:, i]
     pd.DataFrame(q_diag).to_csv(out / "marker_rd_quality_state_diagnostics.csv", index=False)
+    quality_summary_row: Dict[str, Any] = {
+        "__summary_name__": "marker_quality_state_summary",
+        "subject": sbj,
+        "tag": "marker_quality_state",
+        "mean_clean_score_hat": float(np.nanmean(quality["quality_state_test"][:, 0])) if quality["quality_state_test"].shape[1] > 0 else float("nan"),
+        "mean_motion_contam_hat": float(np.nanmean(quality["quality_state_test"][:, 1])) if quality["quality_state_test"].shape[1] > 1 else float("nan"),
+        "mean_posture_shift_hat": float(np.nanmean(quality["quality_state_test"][:, 2])) if quality["quality_state_test"].shape[1] > 2 else float("nan"),
+        "mean_rotation_instability_hat": float(np.nanmean(quality["quality_state_test"][:, 3])) if quality["quality_state_test"].shape[1] > 3 else float("nan"),
+        "mean_translation_instability_hat": float(np.nanmean(quality["quality_state_test"][:, 4])) if quality["quality_state_test"].shape[1] > 4 else float("nan"),
+        "mean_state_uncertainty": float(np.nanmean(quality["quality_state_unc_test"])),
+        "target_marker_valid_rate": float(np.mean(test_pack["marker_valid"])),
+        "source_marker_valid_rate": float(np.mean(train_pack["marker_valid"])),
+    }
+    pd.DataFrame([quality_summary_row]).drop(columns=["__summary_name__"], errors="ignore").to_csv(out / "marker_quality_state_summary.csv", index=False)
+    pd.DataFrame([proxy_metric_row]).drop(columns=["__summary_name__"], errors="ignore").to_csv(out / "marker_quality_state_proxy_metrics.csv", index=False)
 
     pref_row: Dict[str, Any] = {
         "__summary_name__": "marker_rd_papa_preference_summary",
@@ -1846,6 +1995,8 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         "interaction_feature_names": INTERACTION_FEATURE_NAMES,
         "motion_interaction_feature_names": MOTION_INTERACTION_FEATURE_NAMES,
         "quality_state_names": feature_meta.get("quality_state_names", QUALITY_STATE_NAMES),
+        "oracle_quality_state_meta": oracle_state_meta,
+        "quality_state_proxy_metrics": {k: v for k, v in proxy_metric_row.items() if k != "__summary_name__"},
         "quality_columns": [
             "rr_head_stft_abs_diff", "resp_band_entropy", "resp_band_peakness", "resp_band_bandwidth_bpm", "rr_spectral_uncertainty",
             "imu_motion_energy", "imu_stationarity", "imu_motion_entropy", "clean_score", "motion_contam_score",
@@ -1858,7 +2009,7 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         "mard_cuda_device": str(getattr(args, "mard_cuda_device", "auto")),
         "mard_ridge_backend": str(getattr(args, "mard_ridge_backend", "torch")),
         "mard_gate_backend": str(getattr(args, "mard_gate_backend", "torch")),
-        "mard_expert_classifier": str(getattr(args, "mard_expert_classifier", "torch_logreg")),
+        "mard_expert_classifier": str(getattr(args, "mard_expert_classifier", "linear_probe")),
         "mard_tf32_enabled": bool(getattr(args, "mard_enable_tf32", True)),
     })
     with open(out / "marker_rd_feature_meta.json", "w") as f:
@@ -1915,7 +2066,7 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         f"gate={'yes' if gate_meta.get('gate_available', False) else 'no'} "
         f"marker_proxy={'yes' if feature_meta.get('marker_proxy_available', False) else 'no'}"
     )
-    return [row, pref_row, motion_row, *oracle_rows]
+    return [row, pref_row, motion_row, quality_summary_row, proxy_metric_row, *oracle_rows]
 
 
 # -----------------------------------------------------------------------------
@@ -1936,7 +2087,7 @@ def add_marker_rd_args(parser) -> None:
         "low_motion_oracle", "high_motion_stress_test",
     ])
     parser.add_argument("--marker-resp-variant", dest="mard_resp_variant", default="dyn_hybrid", help="Alias for --mard-resp-variant.")
-    parser.add_argument("--marker-expert-classifier", dest="mard_expert_classifier", default="torch_logreg", choices=["logreg", "lda", "torch_logreg"])
+    parser.add_argument("--marker-expert-classifier", dest="mard_expert_classifier", default="linear_probe", choices=["logreg", "lda", "torch_logreg", "linear_probe"])
     parser.add_argument("--marker-gate-temperature", dest="mard_gate_temperature", type=float, default=0.75)
     parser.add_argument("--marker-teacher-alpha", dest="mard_marker_proxy_alpha", type=float, default=10.0)
     parser.add_argument("--marker-profile-alpha", type=float, default=10.0, help="Reserved for future posture-profile regression; accepted for grid compatibility.")
@@ -1948,7 +2099,7 @@ def add_marker_rd_args(parser) -> None:
 
     # Native MA-RD-PAPA names.
     parser.add_argument("--mard-resp-variant", dest="mard_resp_variant", help=argparse.SUPPRESS)
-    parser.add_argument("--mard-expert-classifier", dest="mard_expert_classifier", choices=["logreg", "lda", "torch_logreg"], help=argparse.SUPPRESS)
+    parser.add_argument("--mard-expert-classifier", dest="mard_expert_classifier", choices=["logreg", "lda", "torch_logreg", "linear_probe"], help=argparse.SUPPRESS)
     parser.add_argument("--mard-logreg-c", type=float, default=1.0)
     parser.add_argument("--mard-logreg-max-iter", type=int, default=1500)
     parser.add_argument("--mard-marker-proxy-alpha", dest="mard_marker_proxy_alpha", type=float, help=argparse.SUPPRESS)
@@ -2015,7 +2166,7 @@ def add_papa_dyn_compatible_args(parser) -> None:
     parser.add_argument("--tlx-ridge-alpha", type=float, default=1.0)
     parser.add_argument("--embed-data-group", default=None, choices=["mr", "level", "levels", "mr_levels"])
     parser.add_argument("--embed-labels", default="L0,L2,L3")
-    parser.add_argument("--embed-classifier", default="linear", choices=["lda", "logreg", "linear"])
+    parser.add_argument("--embed-classifier", default="linear_probe", choices=["lda", "logreg", "linear_probe"])
     parser.add_argument("--embed-pooling", default="rich", choices=["mean", "max", "cls_last", "mean_std", "mean_std_max", "rich"])
     parser.add_argument("--embed-stft-profile", action="store_true")
     parser.add_argument("--embed-batch-size", type=int, default=128)
@@ -2048,7 +2199,7 @@ def add_papa_dyn_compatible_args(parser) -> None:
     # Respiratory dynamics branch.
     parser.add_argument("--eval-resp-dyn", action="store_true")
     parser.add_argument("--resp-dyn-ladder", default="all")
-    parser.add_argument("--resp-dyn-classifier", default="lda", choices=["lda", "logreg"])
+    parser.add_argument("--resp-dyn-classifier", default="linear_probe", choices=["lda", "logreg", "linear_probe"])
     parser.add_argument("--resp-dyn-logreg-c", type=float, default=1.0)
     parser.add_argument("--resp-dyn-logreg-max-iter", type=int, default=1000)
     parser.add_argument("--resp-dyn-fs", type=float, default=float(BR_FS))
@@ -2080,7 +2231,7 @@ def finalize_args_marker_rd(args) -> None:
     if getattr(args, "mard_resp_variant", None) is None:
         args.mard_resp_variant = "dyn_hybrid"
     if getattr(args, "mard_expert_classifier", None) is None:
-        args.mard_expert_classifier = "logreg"
+        args.mard_expert_classifier = "linear_probe"
     if getattr(args, "mard_marker_proxy_alpha", None) is None:
         args.mard_marker_proxy_alpha = 10.0
     if getattr(args, "mard_min_marker_rows", None) is None:

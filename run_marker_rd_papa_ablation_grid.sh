@@ -268,7 +268,7 @@ run_tag_on_device() {
           --eval-resp-dyn \
           "${RESP_DYN_ARGS[@]}" \
           --eval-frozen-embeddings \
-          --embed-classifier linear \
+          --embed-classifier linear_probe \
           --embed-pooling rich \
           --embed-stft-profile
         ;;

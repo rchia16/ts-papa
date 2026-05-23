@@ -58,7 +58,7 @@ LAMBDA_RESP_RECON="${LAMBDA_RESP_RECON:-0.01}"
 CONTRAST_WARMUP_EPOCHS="${CONTRAST_WARMUP_EPOCHS:-5}"
 CONTRAST_RAMP_END_EPOCH="${CONTRAST_RAMP_END_EPOCH:-10}"
 
-RESP_DYN_CLASSIFIER="${RESP_DYN_CLASSIFIER:-lda}"
+RESP_DYN_CLASSIFIER="${RESP_DYN_CLASSIFIER:-linear_probe}"
 RESP_DYN_ROLL_WIN="${RESP_DYN_ROLL_WIN:-7}"
 RESP_DYN_HMM_STAY="${RESP_DYN_HMM_STAY:-0.75}"
 RESP_DYN_HMM_MIN_STAY="${RESP_DYN_HMM_MIN_STAY:-0.50}"
@@ -77,7 +77,7 @@ TERTIARY_RESP_VARIANT="${TERTIARY_RESP_VARIANT:-dyn_z_hmm}"
 # Marker branch assumptions. These flags are meant for the implementation that
 # follows this design discussion. They are deliberately explicit so the grid is
 # interpretable rather than a broad hyperparameter sweep.
-MARKER_EXPERT_CLASSIFIER="${MARKER_EXPERT_CLASSIFIER:-torch_logreg}"
+MARKER_EXPERT_CLASSIFIER="${MARKER_EXPERT_CLASSIFIER:-linear_probe}"
 MARKER_GATE_TEMPERATURE="${MARKER_GATE_TEMPERATURE:-0.75}"
 MARKER_TEACHER_ALPHA="${MARKER_TEACHER_ALPHA:-1.0}"
 MARKER_PROFILE_ALPHA="${MARKER_PROFILE_ALPHA:-10.0}"
@@ -335,7 +335,7 @@ run_tag_on_device() {
           --eval-resp-dyn \
           "${RESP_DYN_ARGS[@]}" \
           --eval-frozen-embeddings \
-          --embed-classifier linear \
+          --embed-classifier linear_probe \
           --embed-pooling rich \
           --embed-stft-profile
         ;;

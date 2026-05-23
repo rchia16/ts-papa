@@ -150,7 +150,7 @@ COMMON_ARGS=(
 if [ "${EVAL_FROZEN}" = "1" ]; then
     COMMON_ARGS+=(
         --eval-frozen-embeddings
-        --embed-classifier linear
+        --embed-classifier linear_probe
         --embed-pooling rich
         --embed-stft-profile
         --linear-probe-epochs 30

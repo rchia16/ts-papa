@@ -168,7 +168,7 @@ def _make_embedding_classifier(kind: str):
         return LinearDiscriminantAnalysis()
     if kind == "logreg":
         return LogisticRegression(max_iter=2000, class_weight="balanced", solver="lbfgs", multi_class="auto")
-    if kind == "linear":
+    if kind == "linear_probe":
         return None
     raise ValueError(f"Unsupported --embed-classifier={kind!r}")
 
@@ -211,7 +211,7 @@ def frozen_embedding_evaluate(model: nn.Module, subject: str, subjects: List[str
     scaler = StandardScaler()
     x_train_s = scaler.fit_transform(x_train)
     x_test_s = scaler.transform(x_test)
-    if str(args.embed_classifier).lower() == "linear":
+    if str(args.embed_classifier).lower() == "linear_probe":
         pred = _train_linear_probe(x_train_s, y_train, x_test_s, args, device)
     else:
         clf = _make_embedding_classifier(args.embed_classifier)
@@ -314,7 +314,7 @@ def main() -> None:
     parser.add_argument("--tlx-ridge-alpha", type=float, default=1.0)
     parser.add_argument("--embed-data-group", default=None, choices=["mr", "level", "levels", "mr_levels"])
     parser.add_argument("--embed-labels", default="M,R,L1,L3")
-    parser.add_argument("--embed-classifier", default="lda", choices=["lda", "logreg", "linear"])
+    parser.add_argument("--embed-classifier", default="lda", choices=["lda", "logreg", "linear_probe"])
     parser.add_argument("--embed-pooling", default="mean_std_max", choices=["mean", "max", "cls_last", "mean_std", "mean_std_max", "rich"])
     parser.add_argument("--embed-stft-profile", action="store_true")
     parser.add_argument("--embed-batch-size", type=int, default=128)

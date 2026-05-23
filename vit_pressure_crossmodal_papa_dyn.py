@@ -41,6 +41,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
@@ -874,6 +876,79 @@ def build_ladder_features(
 # -----------------------------------------------------------------------------
 # Classifiers and sequence smoothing
 # -----------------------------------------------------------------------------
+class TorchLinearProbeClassifier:
+    """Sklearn-like multinomial linear probe backed by a single nn.Linear."""
+
+    def __init__(self, max_iter: int = 30, lr: float = 1e-3, batch_size: int = 64, weight_decay: float = 1e-4, device: str = "cpu", seed: int = 42):
+        self.max_iter = int(max_iter)
+        self.lr = float(lr)
+        self.batch_size = int(batch_size)
+        self.weight_decay = float(weight_decay)
+        self.device = str(device)
+        self.seed = int(seed)
+        self.classes_: np.ndarray = np.array([], dtype=int)
+        self.constant_: Optional[int] = None
+        self.model_: Optional[nn.Linear] = None
+        self.mu_: Optional[torch.Tensor] = None
+        self.sd_: Optional[torch.Tensor] = None
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> "TorchLinearProbeClassifier":
+        x_np = np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        y_np = np.asarray(y, dtype=int).reshape(-1)
+        self.classes_ = np.array(sorted(np.unique(y_np).tolist()), dtype=int)
+        if len(self.classes_) < 2 or x_np.shape[0] < max(3, len(self.classes_)):
+            vals, counts = np.unique(y_np, return_counts=True)
+            self.constant_ = int(vals[np.argmax(counts)]) if vals.size else 0
+            self.classes_ = np.array([self.constant_], dtype=int)
+            return self
+        dev = torch.device(self.device if self.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        if dev.type == "cuda" and not torch.cuda.is_available():
+            dev = torch.device("cpu")
+        torch.manual_seed(self.seed)
+        if dev.type == "cuda":
+            torch.cuda.manual_seed_all(self.seed)
+        x_t = torch.as_tensor(x_np, dtype=torch.float32, device=dev)
+        self.mu_ = x_t.mean(dim=0, keepdim=True)
+        self.sd_ = x_t.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+        x_z = (x_t - self.mu_) / self.sd_
+        y_idx = np.searchsorted(self.classes_, y_np).astype(np.int64)
+        y_t = torch.as_tensor(y_idx, dtype=torch.long, device=dev)
+        self.model_ = nn.Linear(x_z.shape[1], len(self.classes_)).to(dev)
+        nn.init.zeros_(self.model_.bias)
+        opt = torch.optim.AdamW(self.model_.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        counts = torch.bincount(y_t, minlength=len(self.classes_)).float().clamp_min(1.0)
+        class_weight = (counts.sum() / (len(self.classes_) * counts)).to(dev)
+        bs = max(1, min(int(self.batch_size), x_z.shape[0]))
+        for _ in range(int(self.max_iter)):
+            perm = torch.randperm(x_z.shape[0], device=dev)
+            for st in range(0, x_z.shape[0], bs):
+                idx = perm[st : st + bs]
+                opt.zero_grad(set_to_none=True)
+                loss = F.cross_entropy(self.model_(x_z[idx]), y_t[idx], weight=class_weight)
+                loss.backward()
+                opt.step()
+        self.constant_ = None
+        return self
+
+    @torch.no_grad()
+    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        x_np = np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if self.model_ is None or self.constant_ is not None:
+            return np.ones((x_np.shape[0], 1), dtype=np.float32)
+        dev = next(self.model_.parameters()).device
+        outs = []
+        bs = max(1, int(self.batch_size))
+        for st in range(0, x_np.shape[0], bs):
+            xb = torch.as_tensor(x_np[st : st + bs], dtype=torch.float32, device=dev)
+            xb = (xb - self.mu_.to(dev)) / self.sd_.to(dev).clamp_min(1e-6)
+            outs.append(torch.softmax(self.model_(xb), dim=1).detach().cpu().numpy().astype(np.float32))
+        return np.concatenate(outs, axis=0)
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        p = self.predict_proba(x)
+        return self.classes_[np.argmax(p, axis=1)].astype(int)
+
+
 def make_resp_dyn_classifier(kind: str, args):
     kind = str(kind).lower()
 
@@ -889,6 +964,16 @@ def make_resp_dyn_classifier(kind: str, args):
             multi_class="auto",
         )
         return make_pipeline(StandardScaler(), clf)
+
+    if kind in {"linear_probe", "torch_linear_probe"}:
+        return TorchLinearProbeClassifier(
+            max_iter=int(getattr(args, "linear_probe_epochs", 30)),
+            lr=float(getattr(args, "linear_probe_lr", 1e-3)),
+            batch_size=int(getattr(args, "linear_probe_batch_size", 64)),
+            weight_decay=float(getattr(args, "linear_probe_weight_decay", 1e-4)),
+            device=str(getattr(args, "device", "cuda" if torch.cuda.is_available() else "cpu")),
+            seed=int(getattr(args, "seed", 42)),
+        )
 
     raise ValueError(f"Unknown --resp-dyn-classifier {kind!r}")
 
@@ -1268,8 +1353,8 @@ def main() -> None:
     parser.add_argument("--embed-labels", default="L0,L2,L3")
     parser.add_argument(
         "--embed-classifier",
-        default="linear",
-        choices=["lda", "logreg", "linear"],
+        default="linear_probe",
+        choices=["lda", "logreg", "linear_probe"],
     )
     parser.add_argument(
         "--embed-pooling",
@@ -1329,8 +1414,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--resp-dyn-classifier",
-        default="lda",
-        choices=["lda", "logreg"],
+        default="linear_probe",
+        choices=["lda", "logreg", "linear_probe"],
     )
     parser.add_argument("--resp-dyn-logreg-c", type=float, default=1.0)
     parser.add_argument("--resp-dyn-logreg-max-iter", type=int, default=1000)
@@ -1375,4 +1460,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
