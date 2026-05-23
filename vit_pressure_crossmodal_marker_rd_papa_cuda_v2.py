@@ -466,6 +466,23 @@ MARKER_FEATURE_NAMES = (
     + ["marker_motion_energy", "marker_stationarity", "marker_posture_drift", "marker_rot_trans_coupling", "marker_burstiness"]
 )
 
+QUALITY_STATE_NAMES = [
+    "clean_score",
+    "motion_contam_score",
+    "posture_shift_score",
+    "rotation_instability_score",
+    "translation_instability_score",
+    "marker_validity_score",
+]
+
+QUALITY_STATE_CLASS_NAMES = [
+    "state_clean_stable",
+    "state_translation_motion",
+    "state_rotation_motion",
+    "state_posture_shift",
+    "state_invalid_uncertain",
+]
+
 INTERACTION_FEATURE_NAMES = [
     "rrdiff_x_imu_motion", "resp_entropy_x_imu_entropy", "resp_peakness_x_imu_stationarity", "resp_bandwidth_x_gyro_entropy",
     "token_rrstd_x_imu_motion", "rrdiff_over_imu_motion", "resp_energy_x_acc_energy", "highband_x_gyro_peak",
@@ -639,6 +656,103 @@ def marker_motion_features(marker: Optional[torch.Tensor], fs: float = float(MAR
     feats = torch.stack([valid_frac] + pos_feats + rot_feats + glob_feats + [motion_energy, stationarity, posture_drift, coupling, burstiness], dim=1)
     valid = (valid_frac > 0.50) & (motion_energy >= 0.0)
     return torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0), valid
+
+
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    return (1.0 / (1.0 + np.exp(-np.clip(x, -40.0, 40.0)))).astype(np.float32)
+
+
+def _feature_col(marker_features: np.ndarray, idx: Dict[str, int], name: str, default: float = 0.0) -> np.ndarray:
+    if name in idx and idx[name] < marker_features.shape[1]:
+        return marker_features[:, idx[name]].astype(np.float32)
+    return np.full(marker_features.shape[0], float(default), dtype=np.float32)
+
+
+def marker_quality_state_targets(
+    marker_features: np.ndarray,
+    marker_valid: np.ndarray,
+    subject_ids: Optional[np.ndarray],
+    args,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Convert marker summaries into low-dimensional motion/reliability targets."""
+    marker = np.nan_to_num(np.asarray(marker_features, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    idx = {name: i for i, name in enumerate(MARKER_FEATURE_NAMES)}
+    n = int(marker.shape[0])
+    if n == 0:
+        return np.zeros((0, len(QUALITY_STATE_NAMES)), dtype=np.float32), np.zeros(0, dtype=bool), {
+            "quality_state_names": QUALITY_STATE_NAMES,
+            "quality_state_available": False,
+        }
+
+    valid_frac = _feature_col(marker, idx, "marker_valid_frac")
+    motion_energy = _feature_col(marker, idx, "marker_motion_energy")
+    stationarity = np.clip(_feature_col(marker, idx, "marker_stationarity", default=1.0), 0.0, 1.0)
+    posture_drift = _feature_col(marker, idx, "marker_posture_drift")
+    burstiness = _feature_col(marker, idx, "marker_burstiness")
+    pos_vel_rms = _feature_col(marker, idx, "marker_pos_vel_rms")
+    pos_jerk_rms = _feature_col(marker, idx, "marker_pos_jerk_rms")
+    pos_drift = _feature_col(marker, idx, "marker_pos_drift")
+    rot_vel_rms = _feature_col(marker, idx, "marker_rot_vel_rms")
+    rot_jerk_rms = _feature_col(marker, idx, "marker_rot_jerk_rms")
+    rot_drift = _feature_col(marker, idx, "marker_rot_drift")
+
+    threshold_mode = str(getattr(args, "mard_quality_state_threshold_mode", "subject_quantile")).lower()
+    z_subject_ids = subject_ids if threshold_mode == "subject_quantile" else None
+    motion_z = subject_robust_z(motion_energy[:, None], z_subject_ids)[:, 0]
+    drift_z = subject_robust_z(posture_drift[:, None], z_subject_ids)[:, 0]
+    rot_z = subject_robust_z((rot_vel_rms + 0.5 * rot_jerk_rms + 0.5 * rot_drift)[:, None], z_subject_ids)[:, 0]
+    pos_z = subject_robust_z((pos_vel_rms + 0.5 * pos_jerk_rms + 0.5 * pos_drift)[:, None], z_subject_ids)[:, 0]
+    burst_z = subject_robust_z(burstiness[:, None], z_subject_ids)[:, 0]
+
+    clean_score = _sigmoid_np(-(0.8 * motion_z + 0.8 * drift_z + 0.5 * burst_z))
+    motion_contam_score = _sigmoid_np(0.8 * motion_z + 0.5 * burst_z + 0.5 * (1.0 - stationarity))
+    posture_shift_score = _sigmoid_np(drift_z)
+    rotation_instability_score = _sigmoid_np(rot_z)
+    translation_instability_score = _sigmoid_np(pos_z)
+    marker_validity_score = np.clip(valid_frac, 0.0, 1.0).astype(np.float32)
+
+    y_state = np.stack(
+        [
+            clean_score,
+            motion_contam_score,
+            posture_shift_score,
+            rotation_instability_score,
+            translation_instability_score,
+            marker_validity_score,
+        ],
+        axis=1,
+    ).astype(np.float32)
+    state_names = list(QUALITY_STATE_NAMES)
+
+    valid = np.asarray(marker_valid, dtype=bool).reshape(-1) & _finite_rows(marker) & (valid_frac >= 0.50)
+    discrete_state = np.full(n, 4, dtype=int)
+    stable = valid & (clean_score >= 0.50) & (motion_contam_score < 0.50) & (posture_shift_score < 0.50)
+    posture = valid & ~stable & (posture_shift_score >= np.maximum(rotation_instability_score, translation_instability_score))
+    trans = valid & ~stable & ~posture & (translation_instability_score >= rotation_instability_score)
+    rot = valid & ~stable & ~posture & ~trans
+    discrete_state[stable] = 0
+    discrete_state[trans] = 1
+    discrete_state[rot] = 2
+    discrete_state[posture] = 3
+
+    if str(getattr(args, "mard_quality_state_dim", "compact")).lower() == "full":
+        onehot = np.zeros((n, len(QUALITY_STATE_CLASS_NAMES)), dtype=np.float32)
+        onehot[np.arange(n), discrete_state] = 1.0
+        y_state = np.concatenate([y_state, onehot], axis=1).astype(np.float32)
+        state_names.extend(QUALITY_STATE_CLASS_NAMES)
+
+    meta = {
+        "quality_state_names": state_names,
+        "quality_state_available": bool(valid.any()),
+        "quality_state_valid_rows": int(valid.sum()),
+        "quality_state_dim": int(y_state.shape[1]),
+        "quality_state_threshold_mode": threshold_mode,
+        "quality_state_source_dim": str(getattr(args, "mard_quality_state_dim", "compact")),
+        "quality_state_class_counts": {QUALITY_STATE_CLASS_NAMES[i]: int(np.sum(discrete_state == i)) for i in range(len(QUALITY_STATE_CLASS_NAMES))},
+        "quality_state_feature_indices": {k: int(idx[k]) for k in idx},
+    }
+    return np.clip(np.nan_to_num(y_state, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0).astype(np.float32), valid, meta
 
 
 def interaction_features(resp_static: np.ndarray, activity_static: np.ndarray) -> np.ndarray:
@@ -1075,6 +1189,119 @@ def fit_marker_proxy(
     return pred_train.astype(np.float32), unc_train, pred_test.astype(np.float32), unc_test, meta
 
 
+def fit_marker_quality_state_proxy(
+    x_ar_train: np.ndarray,
+    marker_features_train: np.ndarray,
+    marker_valid_train: np.ndarray,
+    train_subject_ids: np.ndarray,
+    x_ar_test: np.ndarray,
+    args,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Train source-only AR -> compact marker quality/reliability state."""
+    x_ar_train = np.nan_to_num(np.asarray(x_ar_train, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    x_ar_test = np.nan_to_num(np.asarray(x_ar_test, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    sids = np.asarray(train_subject_ids, dtype=object)
+    y_state, valid, state_meta = marker_quality_state_targets(
+        marker_features=np.asarray(marker_features_train, dtype=np.float32),
+        marker_valid=np.asarray(marker_valid_train, dtype=bool),
+        subject_ids=sids,
+        args=args,
+    )
+
+    mode = str(getattr(args, "marker_mode", "quality_gate"))
+    if mode == "shuffled_teacher_control" and int(valid.sum()) > 1:
+        rng = np.random.default_rng(int(getattr(args, "seed", 42)))
+        y_state[valid] = y_state[valid][rng.permutation(int(valid.sum()))]
+    elif mode == "time_shift_control" and int(valid.sum()) > 1:
+        shift = max(1, int(round(0.25 * int(valid.sum()))))
+        y_state[valid] = np.roll(y_state[valid], shift=shift, axis=0)
+    elif mode == "time_only_control":
+        t = np.linspace(-1.0, 1.0, y_state.shape[0], dtype=np.float32).reshape(-1, 1)
+        basis = np.concatenate([0.5 + 0.5 * t, t ** 2, 0.5 + 0.5 * np.sin(np.pi * t), 0.5 + 0.5 * np.cos(np.pi * t)], axis=1)
+        reps = int(np.ceil(y_state.shape[1] / basis.shape[1])) if y_state.ndim == 2 and y_state.shape[1] else 1
+        y_state = np.tile(basis, (1, reps))[:, : y_state.shape[1]].astype(np.float32)
+
+    min_rows = int(getattr(args, "mard_min_marker_rows", 50))
+    min_subjects = int(getattr(args, "mard_marker_min_subjects", 3))
+    source_mode = str(getattr(args, "mard_quality_state_source_mode", getattr(args, "mard_marker_source_mode", "inferred"))).lower()
+    d = int(y_state.shape[1]) if y_state.ndim == 2 else len(QUALITY_STATE_NAMES)
+    neutral = np.zeros((x_ar_train.shape[0], d), dtype=np.float32)
+    neutral[:, 0] = 0.5
+    if d > 1:
+        neutral[:, 1:] = 0.5
+    zeros_tr = neutral
+    zeros_te = np.tile(neutral[:1], (x_ar_test.shape[0], 1)).astype(np.float32)
+    high_unc_tr = np.ones((x_ar_train.shape[0], 1), dtype=np.float32)
+    high_unc_te = np.ones((x_ar_test.shape[0], 1), dtype=np.float32)
+    valid_subjects = [sid for sid in pd.unique(sids[valid])]
+    if int(valid.sum()) < min_rows or len(valid_subjects) < min_subjects:
+        meta = {
+            **state_meta,
+            "marker_proxy_available": False,
+            "marker_proxy_kind": "quality_state",
+            "marker_proxy_valid_rows": int(valid.sum()),
+            "marker_proxy_valid_subjects": int(len(valid_subjects)),
+            "marker_proxy_dim": int(d),
+            "quality_state_proxy_available": False,
+        }
+        return zeros_tr, high_unc_tr, zeros_te, high_unc_te, meta
+
+    alpha = float(getattr(args, "mard_marker_proxy_alpha", 10.0))
+    y_scaler = StandardScaler().fit(y_state[valid])
+    y_z = y_scaler.transform(y_state[valid]).astype(np.float32)
+
+    def fit_predict(tr_mask: np.ndarray, xp: np.ndarray) -> np.ndarray:
+        yz = y_scaler.transform(y_state[tr_mask]).astype(np.float32)
+        pred_z = _fit_ridge_predict(x_ar_train[tr_mask], yz, xp, alpha, args=args)
+        return np.clip(y_scaler.inverse_transform(pred_z), 0.0, 1.0).astype(np.float32)
+
+    pred_test = np.clip(y_scaler.inverse_transform(_fit_ridge_predict(x_ar_train[valid], y_z, x_ar_test, alpha, args=args)), 0.0, 1.0).astype(np.float32)
+    pred_train_full = np.clip(y_scaler.inverse_transform(_fit_ridge_predict(x_ar_train[valid], y_z, x_ar_train, alpha, args=args)), 0.0, 1.0).astype(np.float32)
+    pred_train = pred_train_full.copy()
+    if source_mode == "observed":
+        pred_train[valid] = y_state[valid]
+    else:
+        for sid in pd.unique(sids):
+            row_mask = sids == sid
+            val_mask = row_mask & valid
+            tr_mask = (~row_mask) & valid
+            if int(val_mask.sum()) == 0:
+                continue
+            if int(tr_mask.sum()) >= min_rows and len(pd.unique(sids[tr_mask])) >= max(2, min_subjects - 1):
+                pred_train[val_mask] = fit_predict(tr_mask, x_ar_train[val_mask])
+            else:
+                pred_train[val_mask] = pred_train_full[val_mask]
+
+    residual = np.sqrt(np.mean((pred_train[valid] - y_state[valid]) ** 2, axis=1))
+    resid_scale = float(np.nanmedian(residual) + np.nanstd(residual)) if residual.size else 1.0
+    resid_scale = max(resid_scale, 1e-6)
+    scaler = StandardScaler().fit(x_ar_train[valid])
+    z_src = scaler.transform(x_ar_train[valid])
+    z_mu = z_src.mean(axis=0, keepdims=True)
+
+    def uncertainty(x: np.ndarray) -> np.ndarray:
+        z = scaler.transform(np.nan_to_num(x, nan=0.0))
+        dist = np.sqrt(np.mean((z - z_mu) ** 2, axis=1, keepdims=True))
+        return np.clip(resid_scale * (1.0 + dist), 0.0, 100.0).astype(np.float32)
+
+    unc_train = uncertainty(x_ar_train)
+    unc_test = uncertainty(x_ar_test)
+    meta = {
+        **state_meta,
+        "marker_proxy_available": True,
+        "marker_proxy_kind": "quality_state",
+        "marker_proxy_valid_rows": int(valid.sum()),
+        "marker_proxy_valid_subjects": int(len(valid_subjects)),
+        "marker_proxy_dim": int(d),
+        "marker_proxy_source_mode": source_mode,
+        "marker_proxy_resid_median": float(np.nanmedian(residual)),
+        "marker_proxy_resid_scale": float(resid_scale),
+        "quality_state_proxy_available": True,
+        "quality_state_proxy_source_mode": source_mode,
+    }
+    return pred_train.astype(np.float32), unc_train, pred_test.astype(np.float32), unc_test, meta
+
+
 def build_marker_rd_feature_blocks(train: Dict[str, np.ndarray], test: Dict[str, np.ndarray], args) -> Tuple[OrderedDict[str, Tuple[np.ndarray, np.ndarray]], Dict[str, np.ndarray], Dict[str, Any]]:
     y_train = train["y"].astype(int)
     train_ids = train.get("subject_ids")
@@ -1120,18 +1347,70 @@ def build_marker_rd_feature_blocks(train: Dict[str, np.ndarray], test: Dict[str,
     x_ar_tr = concat_features(x_resp_tr, x_act_tr, x_int_tr)
     x_ar_te = concat_features(x_resp_te, x_act_te, x_int_te)
 
-    m_proxy_tr, m_unc_tr, m_proxy_te, m_unc_te, marker_meta = fit_marker_proxy(
-        x_ar_train=x_ar_tr,
-        marker_train=train["x_marker"],
-        marker_valid_train=train["marker_valid"],
-        train_subject_ids=np.asarray(train_ids if train_ids is not None else np.full(len(y_train), "__source__", dtype=object), dtype=object),
-        x_ar_test=x_ar_te,
-        args=args,
-    )
+    marker_target = str(getattr(args, "mard_marker_target", "quality_state")).lower()
+    source_ids = np.asarray(train_ids if train_ids is not None else np.full(len(y_train), "__source__", dtype=object), dtype=object)
+    if marker_target == "full_proxy":
+        m_proxy_tr, m_unc_tr, m_proxy_te, m_unc_te, marker_meta = fit_marker_proxy(
+            x_ar_train=x_ar_tr,
+            marker_train=train["x_marker"],
+            marker_valid_train=train["marker_valid"],
+            train_subject_ids=source_ids,
+            x_ar_test=x_ar_te,
+            args=args,
+        )
+        m_state_tr, _valid_tr, state_meta_tr = marker_quality_state_targets(
+            m_proxy_tr,
+            np.ones(m_proxy_tr.shape[0], dtype=bool),
+            source_ids,
+            args,
+        )
+        m_state_te, _valid_te, state_meta_te = marker_quality_state_targets(
+            m_proxy_te,
+            np.ones(m_proxy_te.shape[0], dtype=bool),
+            np.asarray(test_ids, dtype=object) if test_ids is not None else None,
+            args,
+        )
+        m_state_unc_tr, m_state_unc_te = m_unc_tr, m_unc_te
+        marker_meta.update({
+            "marker_proxy_kind": "full_proxy",
+            "quality_state_from_full_proxy_train": state_meta_tr,
+            "quality_state_from_full_proxy_test": state_meta_te,
+        })
+    else:
+        m_state_tr, m_state_unc_tr, m_state_te, m_state_unc_te, marker_meta = fit_marker_quality_state_proxy(
+            x_ar_train=x_ar_tr,
+            marker_features_train=train["x_marker"],
+            marker_valid_train=train["marker_valid"],
+            train_subject_ids=source_ids,
+            x_ar_test=x_ar_te,
+            args=args,
+        )
+        m_proxy_tr, m_unc_tr, m_proxy_te, m_unc_te = m_state_tr, m_state_unc_tr, m_state_te, m_state_unc_te
+
+    mode = str(getattr(args, "marker_mode", "quality_gate"))
+    if mode == "quality_state_oracle_gate":
+        observed_te, observed_valid_te, observed_meta_te = marker_quality_state_targets(
+            marker_features=test["x_marker"],
+            marker_valid=test["marker_valid"],
+            subject_ids=np.asarray(test_ids, dtype=object) if test_ids is not None else None,
+            args=args,
+        )
+        if observed_te.shape == m_state_te.shape:
+            use_obs = np.asarray(observed_valid_te, dtype=bool).reshape(-1)
+            m_state_te = m_state_te.copy()
+            m_state_unc_te = m_state_unc_te.copy()
+            m_state_te[use_obs] = observed_te[use_obs]
+            m_state_unc_te[use_obs] = 0.0
+            m_proxy_te, m_unc_te = m_state_te, m_state_unc_te
+        marker_meta.update({
+            "quality_state_oracle_gate": True,
+            "quality_state_oracle_target_valid_rows": int(np.sum(observed_valid_te)),
+            "quality_state_oracle_target_meta": observed_meta_te,
+        })
+
     x_mint_tr = motion_interaction_features(train["x_resp_static"], train["x_activity_static"], m_proxy_tr)
     x_mint_te = motion_interaction_features(test["x_resp_static"], test["x_activity_static"], m_proxy_te)
 
-    mode = str(getattr(args, "marker_mode", "quality_gate"))
     blocks: OrderedDict[str, Tuple[np.ndarray, np.ndarray]] = OrderedDict()
     blocks["resp_dyn"] = (x_resp_tr, x_resp_te)
 
@@ -1140,28 +1419,37 @@ def build_marker_rd_feature_blocks(train: Dict[str, np.ndarray], test: Dict[str,
         blocks["activity_dyn"] = (x_act_tr, x_act_te)
         blocks["resp_activity"] = (concat_features(x_resp_tr, x_act_tr, x_int_tr), concat_features(x_resp_te, x_act_te, x_int_te))
 
-    use_marker_proxy_blocks = bool(getattr(args, "mard_use_marker_proxy_blocks", False)) or mode in {
+    use_marker_proxy_blocks = marker_target == "full_proxy" and (bool(getattr(args, "mard_use_marker_proxy_blocks", False)) or mode in {
         "teacher_motion_state", "posture_profile_expert", "shuffled_teacher_control", "time_shift_control", "time_only_control"
-    }
+    })
     if use_marker_proxy_blocks:
         blocks["marker_proxy"] = (concat_features(m_proxy_tr, m_unc_tr), concat_features(m_proxy_te, m_unc_te))
         blocks["motion_aware_resp"] = (concat_features(x_resp_tr, m_proxy_tr, m_unc_tr, x_mint_tr), concat_features(x_resp_te, m_proxy_te, m_unc_te, x_mint_te))
         blocks["motion_aware_resp_activity"] = (concat_features(x_ar_tr, m_proxy_tr, m_unc_tr, x_mint_tr), concat_features(x_ar_te, m_proxy_te, m_unc_te, x_mint_te))
+    use_quality_state_blocks = marker_target == "quality_state" and bool(getattr(args, "mard_use_quality_state_blocks", False))
+    if use_quality_state_blocks:
+        blocks["quality_state"] = (concat_features(m_state_tr, m_state_unc_tr), concat_features(m_state_te, m_state_unc_te))
+        blocks["quality_conditioned_resp"] = (concat_features(x_resp_tr, m_state_tr, m_state_unc_tr), concat_features(x_resp_te, m_state_te, m_state_unc_te))
     if "papa_state" in train and "papa_state" in test:
         blocks["papa_state"] = (train["papa_state"], test["papa_state"])
 
-    def quality(resp_static: np.ndarray, act_static: np.ndarray, marker_proxy: np.ndarray, marker_unc: np.ndarray) -> np.ndarray:
+    def quality(resp_static: np.ndarray, act_static: np.ndarray, motion_state: np.ndarray, motion_unc: np.ndarray) -> np.ndarray:
         n = resp_static.shape[0]
         motion_energy = act_static[:, 12] if act_static.shape[1] > 12 else np.zeros(n)
         stationarity = act_static[:, 13] if act_static.shape[1] > 13 else np.ones(n)
         acc_entropy = act_static[:, 15] if act_static.shape[1] > 15 else np.zeros(n)
         gyro_entropy = act_static[:, 19] if act_static.shape[1] > 19 else np.zeros(n)
-        marker_valid_frac = marker_proxy[:, 0] if marker_proxy.shape[1] > 0 else np.zeros(n)
-        marker_motion = marker_proxy[:, -5] if marker_proxy.shape[1] >= 5 else np.zeros(n)
-        marker_stationarity = marker_proxy[:, -4] if marker_proxy.shape[1] >= 4 else np.ones(n)
-        marker_drift = marker_proxy[:, -3] if marker_proxy.shape[1] >= 3 else np.zeros(n)
-        marker_entropy = marker_proxy[:, 1 + 2 * len(SEQ_FEATURE_NAMES) + 12] if marker_proxy.shape[1] > 1 + 2 * len(SEQ_FEATURE_NAMES) + 12 else np.zeros(n)
-        marker_burst = marker_proxy[:, -1] if marker_proxy.shape[1] >= 1 else np.zeros(n)
+        state = np.asarray(motion_state, dtype=np.float32)
+        if state.shape[1] < len(QUALITY_STATE_NAMES):
+            pad = np.zeros((n, len(QUALITY_STATE_NAMES) - state.shape[1]), dtype=np.float32)
+            state = np.concatenate([state, pad], axis=1)
+        clean = state[:, 0]
+        motion_contam = state[:, 1]
+        posture_shift = state[:, 2]
+        rot_instability = state[:, 3]
+        trans_instability = state[:, 4]
+        validity = state[:, 5]
+        state_uncertainty = np.asarray(motion_unc, dtype=np.float32).reshape(-1)
         cols = [
             resp_static[:, 2] if resp_static.shape[1] > 2 else np.zeros(n),
             resp_static[:, 4] if resp_static.shape[1] > 4 else np.zeros(n),
@@ -1171,18 +1459,18 @@ def build_marker_rd_feature_blocks(train: Dict[str, np.ndarray], test: Dict[str,
             motion_energy,
             stationarity,
             0.5 * (acc_entropy + gyro_entropy),
-            marker_unc.reshape(-1),
-            marker_valid_frac,
-            marker_motion,
-            marker_stationarity,
-            marker_drift,
-            marker_entropy,
-            marker_burst,
+            clean,
+            motion_contam,
+            posture_shift,
+            rot_instability,
+            trans_instability,
+            validity,
+            state_uncertainty,
         ]
         return np.stack(cols, axis=1).astype(np.float32)
 
-    q_train = quality(train["x_resp_static"], train["x_activity_static"], m_proxy_tr, m_unc_tr)
-    q_test = quality(test["x_resp_static"], test["x_activity_static"], m_proxy_te, m_unc_te)
+    q_train = quality(train["x_resp_static"], train["x_activity_static"], m_state_tr, m_state_unc_tr)
+    q_test = quality(test["x_resp_static"], test["x_activity_static"], m_state_te, m_state_unc_te)
     q = {
         "train": q_train,
         "test": q_test,
@@ -1190,12 +1478,18 @@ def build_marker_rd_feature_blocks(train: Dict[str, np.ndarray], test: Dict[str,
         "marker_proxy_test": m_proxy_te,
         "marker_unc_train": m_unc_tr,
         "marker_unc_test": m_unc_te,
+        "quality_state_train": m_state_tr,
+        "quality_state_test": m_state_te,
+        "quality_state_unc_train": m_state_unc_tr,
+        "quality_state_unc_test": m_state_unc_te,
     }
     meta = {
         "resp_variant": resp_variant,
         "marker_mode": mode,
+        "marker_target": marker_target,
         "use_activity_blocks": bool(use_activity_blocks),
         "use_marker_proxy_blocks": bool(use_marker_proxy_blocks),
+        "use_quality_state_blocks": bool(use_quality_state_blocks),
         "blocks": {k: {"train_dim": int(v[0].shape[1]), "test_dim": int(v[1].shape[1])} for k, v in blocks.items()},
         **marker_meta,
     }
@@ -1393,6 +1687,21 @@ def fit_outer_experts(blocks: OrderedDict[str, Tuple[np.ndarray, np.ndarray]], y
     return final.astype(np.float32), weights.astype(np.float32), pred_by_expert, conf_by_expert
 
 
+def quality_state_reliability(quality_state: np.ndarray, quality_unc: np.ndarray) -> np.ndarray:
+    state = np.asarray(quality_state, dtype=np.float32)
+    n = state.shape[0]
+    if state.shape[1] < len(QUALITY_STATE_NAMES):
+        pad = np.zeros((n, len(QUALITY_STATE_NAMES) - state.shape[1]), dtype=np.float32)
+        state = np.concatenate([state, pad], axis=1)
+    clean = np.clip(state[:, 0], 0.0, 1.0)
+    motion_contam = np.clip(state[:, 1], 0.0, 1.0)
+    posture_shift = np.clip(state[:, 2], 0.0, 1.0)
+    unc = np.asarray(quality_unc, dtype=np.float32).reshape(-1)
+    low_unc = 1.0 / (1.0 + np.clip(unc, 0.0, 100.0))
+    rel = clean * (1.0 - motion_contam) * (1.0 - posture_shift) * low_unc
+    return np.clip(np.nan_to_num(rel, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0).astype(np.float32)
+
+
 def safe_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, classes_train: np.ndarray, prefix: str) -> Dict[str, float]:
     y_true = np.asarray(y_true, dtype=int)
     y_pred = np.asarray(y_pred, dtype=int)
@@ -1435,10 +1744,15 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
     gate, gate_meta = train_preference_gate(blocks, y_train, np.asarray(train_pack.get("subject_ids", np.full(len(y_train), "__all__", dtype=object)), dtype=object), quality["train"], global_classes, args)
     final_proba, weights, pred_by_expert, conf_by_expert = fit_outer_experts(blocks, y_train, global_classes, quality["test"], gate, args)
 
-    if bool(getattr(args, "mard_hmm_smooth", False)) and final_proba.shape[1] > 1:
-        idx = dyn.viterbi_smooth(np.log(np.clip(final_proba, 1e-12, 1.0)), stay_prob=dyn.effective_hmm_stay(final_proba, args))
+    reliability_test = quality_state_reliability(quality["quality_state_test"], quality["quality_state_unc_test"])
+    if bool(getattr(args, "mard_quality_state_hmm", getattr(args, "mard_hmm_smooth", False))) and final_proba.shape[1] > 1:
+        uniform = np.ones_like(final_proba, dtype=np.float32) / float(final_proba.shape[1])
+        emission_proba = reliability_test[:, None] * final_proba + (1.0 - reliability_test[:, None]) * uniform
+        base_stay = float(dyn.effective_hmm_stay(final_proba, args))
+        alpha = float(getattr(args, "mard_quality_state_hmm_alpha", 0.15))
+        effective_stay = float(np.clip(base_stay + alpha * (1.0 - float(np.nanmean(reliability_test))), 0.0, 0.999))
+        idx = dyn.viterbi_smooth(np.log(np.clip(emission_proba, 1e-12, 1.0)), stay_prob=effective_stay)
         y_pred = global_classes[idx].astype(int)
-        effective_stay = float(dyn.effective_hmm_stay(final_proba, args))
     else:
         y_pred = global_classes[np.argmax(final_proba, axis=1)].astype(int)
         effective_stay = float("nan")
@@ -1457,9 +1771,14 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         "resp_band_entropy": test_pack["x_resp_static"][:, 4] if test_pack["x_resp_static"].shape[1] > 4 else np.nan,
         "imu_motion_energy": test_pack["x_activity_static"][:, 12] if test_pack["x_activity_static"].shape[1] > 12 else np.nan,
         "imu_stationarity": test_pack["x_activity_static"][:, 13] if test_pack["x_activity_static"].shape[1] > 13 else np.nan,
-        "marker_proxy_uncertainty": quality["marker_unc_test"].reshape(-1),
-        "marker_proxy_motion_energy": quality["marker_proxy_test"][:, -5] if quality["marker_proxy_test"].shape[1] >= 5 else np.nan,
-        "marker_proxy_stationarity": quality["marker_proxy_test"][:, -4] if quality["marker_proxy_test"].shape[1] >= 4 else np.nan,
+        "quality_state_uncertainty": quality["quality_state_unc_test"].reshape(-1),
+        "quality_state_reliability": reliability_test,
+        "quality_clean_score": quality["quality_state_test"][:, 0] if quality["quality_state_test"].shape[1] > 0 else np.nan,
+        "quality_motion_contam_score": quality["quality_state_test"][:, 1] if quality["quality_state_test"].shape[1] > 1 else np.nan,
+        "quality_posture_shift_score": quality["quality_state_test"][:, 2] if quality["quality_state_test"].shape[1] > 2 else np.nan,
+        "quality_rotation_instability_score": quality["quality_state_test"][:, 3] if quality["quality_state_test"].shape[1] > 3 else np.nan,
+        "quality_translation_instability_score": quality["quality_state_test"][:, 4] if quality["quality_state_test"].shape[1] > 4 else np.nan,
+        "quality_marker_validity_score": quality["quality_state_test"][:, 5] if quality["quality_state_test"].shape[1] > 5 else np.nan,
         "marker_available_target": test_pack["marker_valid"].astype(int),
     }
     for ei, name in enumerate(blocks.keys()):
@@ -1468,6 +1787,17 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         trace[f"conf_{name}"] = conf_by_expert[name]
     pd.DataFrame(trace).to_csv(out / "marker_rd_preference_trace.csv", index=False)
     pd.DataFrame({"y_true": y_test.astype(int), "y_pred": y_pred.astype(int), "final_conf": final_conf}).to_csv(out / "marker_rd_predictions.csv", index=False)
+    q_diag = {
+        "subject_id": test_pack.get("subject_ids", np.asarray([sbj] * len(y_test), dtype=object)).astype(str),
+        "window_idx": np.arange(len(y_test), dtype=int),
+        "quality_state_uncertainty": quality["quality_state_unc_test"].reshape(-1),
+        "quality_state_reliability": reliability_test,
+        "marker_available_target": test_pack["marker_valid"].astype(int),
+    }
+    for i, name in enumerate(feature_meta.get("quality_state_names", QUALITY_STATE_NAMES)):
+        if i < quality["quality_state_test"].shape[1]:
+            q_diag[name] = quality["quality_state_test"][:, i]
+    pd.DataFrame(q_diag).to_csv(out / "marker_rd_quality_state_diagnostics.csv", index=False)
 
     pref_row: Dict[str, Any] = {
         "__summary_name__": "marker_rd_papa_preference_summary",
@@ -1496,10 +1826,12 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         "marker_proxy_available": bool(feature_meta.get("marker_proxy_available", False)),
         "marker_proxy_valid_rows": int(feature_meta.get("marker_proxy_valid_rows", 0)),
         "marker_proxy_valid_subjects": int(feature_meta.get("marker_proxy_valid_subjects", 0)),
-        "marker_proxy_unc_mean": float(np.nanmean(quality["marker_unc_test"])),
-        "marker_proxy_unc_std": float(np.nanstd(quality["marker_unc_test"])),
-        "marker_proxy_motion_mean": float(np.nanmean(quality["marker_proxy_test"][:, -5])) if quality["marker_proxy_test"].shape[1] >= 5 else float("nan"),
-        "marker_proxy_stationarity_mean": float(np.nanmean(quality["marker_proxy_test"][:, -4])) if quality["marker_proxy_test"].shape[1] >= 4 else float("nan"),
+        "quality_state_unc_mean": float(np.nanmean(quality["quality_state_unc_test"])),
+        "quality_state_unc_std": float(np.nanstd(quality["quality_state_unc_test"])),
+        "quality_reliability_mean": float(np.nanmean(reliability_test)),
+        "quality_clean_mean": float(np.nanmean(quality["quality_state_test"][:, 0])) if quality["quality_state_test"].shape[1] > 0 else float("nan"),
+        "quality_motion_contam_mean": float(np.nanmean(quality["quality_state_test"][:, 1])) if quality["quality_state_test"].shape[1] > 1 else float("nan"),
+        "quality_posture_shift_mean": float(np.nanmean(quality["quality_state_test"][:, 2])) if quality["quality_state_test"].shape[1] > 2 else float("nan"),
     }
     pd.DataFrame([motion_row]).drop(columns=["__summary_name__"], errors="ignore").to_csv(out / "marker_rd_motion_summary.csv", index=False)
 
@@ -1513,14 +1845,16 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         "marker_feature_names": MARKER_FEATURE_NAMES,
         "interaction_feature_names": INTERACTION_FEATURE_NAMES,
         "motion_interaction_feature_names": MOTION_INTERACTION_FEATURE_NAMES,
+        "quality_state_names": feature_meta.get("quality_state_names", QUALITY_STATE_NAMES),
         "quality_columns": [
             "rr_head_stft_abs_diff", "resp_band_entropy", "resp_band_peakness", "resp_band_bandwidth_bpm", "rr_spectral_uncertainty",
-            "imu_motion_energy", "imu_stationarity", "imu_motion_entropy", "marker_proxy_uncertainty", "marker_valid_frac",
-            "marker_motion_energy", "marker_stationarity", "marker_posture_drift", "marker_motion_entropy", "marker_burstiness",
+            "imu_motion_energy", "imu_stationarity", "imu_motion_entropy", "clean_score", "motion_contam_score",
+            "posture_shift_score", "rotation_instability_score", "translation_instability_score", "marker_validity_score",
+            "state_uncertainty",
         ],
         "gate_meta": gate_meta,
-        "main_prediction_uses_target_marker": False,
-        "marker_role": "source marker supervises an IMU/RR-derived motion/posture proxy and reliability gate; target marker is ignored outside oracle audit",
+        "main_prediction_uses_target_marker": str(getattr(args, "marker_mode", "quality_gate")) == "quality_state_oracle_gate",
+        "marker_role": "source marker supervises an IMU/RR-derived motion/posture proxy and reliability gate; target marker is ignored except for quality_state_oracle_gate/oracle audit diagnostics",
         "mard_cuda_device": str(getattr(args, "mard_cuda_device", "auto")),
         "mard_ridge_backend": str(getattr(args, "mard_ridge_backend", "torch")),
         "mard_gate_backend": str(getattr(args, "mard_gate_backend", "torch")),
@@ -1541,9 +1875,12 @@ def marker_rd_papa_hook(model, sbj: str, subjects: List[str], _train_loader, _te
         "marker_rd_n_classes_test": int(len(np.unique(y_test))),
         "marker_rd_mean_conf": float(np.nanmean(final_conf)),
         "marker_rd_hmm_smooth": bool(getattr(args, "mard_hmm_smooth", False)),
+        "marker_rd_quality_state_hmm": bool(getattr(args, "mard_quality_state_hmm", getattr(args, "mard_hmm_smooth", False))),
         "marker_rd_effective_hmm_stay": effective_stay,
         "marker_rd_use_marker_proxy_blocks": bool(getattr(args, "mard_use_marker_proxy_blocks", False)),
-        "marker_rd_uses_target_marker": False,
+        "marker_rd_use_quality_state_blocks": bool(getattr(args, "mard_use_quality_state_blocks", False)),
+        "marker_rd_marker_target": str(feature_meta.get("marker_target", getattr(args, "mard_marker_target", "quality_state"))),
+        "marker_rd_uses_target_marker": str(getattr(args, "marker_mode", "quality_gate")) == "quality_state_oracle_gate",
         **metrics,
     }
 
@@ -1595,7 +1932,7 @@ def add_marker_rd_args(parser) -> None:
     parser.add_argument("--marker-source-only", action="store_true", default=True, help="Compatibility flag; main prediction never uses target marker.")
     parser.add_argument("--marker-mode", default="quality_gate", choices=[
         "none", "imu_activity_gate", "teacher_motion_state", "quality_gate", "posture_profile_gate", "posture_profile_expert",
-        "oracle_audit", "marker_only_oracle", "shuffled_teacher_control", "time_shift_control", "time_only_control",
+        "quality_state_oracle_gate", "oracle_audit", "marker_only_oracle", "shuffled_teacher_control", "time_shift_control", "time_only_control",
         "low_motion_oracle", "high_motion_stress_test",
     ])
     parser.add_argument("--marker-resp-variant", dest="mard_resp_variant", default="dyn_hybrid", help="Alias for --mard-resp-variant.")
@@ -1615,6 +1952,10 @@ def add_marker_rd_args(parser) -> None:
     parser.add_argument("--mard-logreg-c", type=float, default=1.0)
     parser.add_argument("--mard-logreg-max-iter", type=int, default=1500)
     parser.add_argument("--mard-marker-proxy-alpha", dest="mard_marker_proxy_alpha", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--mard-marker-target", default="quality_state", choices=["quality_state", "full_proxy"])
+    parser.add_argument("--mard-quality-state-source-mode", default="inferred", choices=["inferred", "observed"])
+    parser.add_argument("--mard-quality-state-dim", default="compact", choices=["compact", "full"])
+    parser.add_argument("--mard-quality-state-threshold-mode", default="subject_quantile", choices=["subject_quantile", "source_global"])
     parser.add_argument("--mard-marker-source-mode", default="inferred", choices=["inferred", "observed"])
     parser.add_argument("--mard-marker-min-subjects", type=int, default=3)
     parser.add_argument("--mard-min-marker-rows", dest="mard_min_marker_rows", type=int, help=argparse.SUPPRESS)
@@ -1622,6 +1963,8 @@ def add_marker_rd_args(parser) -> None:
     parser.add_argument("--mard-allow-missing-marker", dest="mard_allow_missing_marker", action="store_true", default=True)
     parser.add_argument("--mard-require-marker", dest="mard_allow_missing_marker", action="store_false")
     parser.add_argument("--mard-use-marker-proxy-blocks", action="store_true", default=False, help="Add proxy-conditioned marker blocks as classifier features. Default keeps marker as gate/quality only.")
+    parser.add_argument("--mard-use-quality-state-blocks", dest="mard_use_quality_state_blocks", action="store_true", default=False, help="Add predicted quality state as direct classifier features.")
+    parser.add_argument("--mard-no-quality-state-blocks", dest="mard_use_quality_state_blocks", action="store_false")
     parser.add_argument("--mard-use-preference-gate", dest="mard_use_preference_gate", action="store_true", default=True)
     parser.add_argument("--mard-no-preference-gate", dest="mard_use_preference_gate", action="store_false")
     parser.add_argument("--mard-min-pseudo-windows", type=int, default=5)
@@ -1630,6 +1973,9 @@ def add_marker_rd_args(parser) -> None:
     parser.add_argument("--mard-gate-max-iter", type=int, default=1500)
     parser.add_argument("--mard-gate-temperature", dest="mard_gate_temperature", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--mard-hmm-smooth", dest="mard_hmm_smooth", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--mard-quality-state-hmm", dest="mard_quality_state_hmm", action="store_true", default=False)
+    parser.add_argument("--mard-no-quality-state-hmm", dest="mard_quality_state_hmm", action="store_false")
+    parser.add_argument("--mard-quality-state-hmm-alpha", type=float, default=0.15)
     parser.add_argument("--mard-oracle-audit", dest="mard_oracle_audit", action="store_true", default=True)
     parser.add_argument("--mard-no-oracle-audit", dest="mard_oracle_audit", action="store_false")
 
@@ -1741,6 +2087,8 @@ def finalize_args_marker_rd(args) -> None:
         args.mard_min_marker_rows = 50
     if getattr(args, "mard_gate_temperature", None) is None:
         args.mard_gate_temperature = 0.75
+    if bool(getattr(args, "mard_hmm_smooth", False)):
+        args.mard_quality_state_hmm = True
 
     # CRA-CUDA style speed controls for Ampere+ GPUs. This only affects torch/CUDA
     # operations; sklearn fallbacks are unchanged.
@@ -1759,8 +2107,11 @@ def finalize_args_marker_rd(args) -> None:
         args.mard_cuda_device = str(getattr(args, "device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     mode = str(getattr(args, "marker_mode", "quality_gate"))
-    if mode in {"teacher_motion_state", "posture_profile_expert", "shuffled_teacher_control", "time_shift_control", "time_only_control"}:
+    marker_target = str(getattr(args, "mard_marker_target", "quality_state")).lower()
+    if marker_target == "full_proxy" and mode in {"teacher_motion_state", "posture_profile_expert", "shuffled_teacher_control", "time_shift_control", "time_only_control"}:
         args.mard_use_marker_proxy_blocks = True
+    if marker_target == "quality_state" and mode in {"posture_profile_expert"}:
+        args.mard_use_quality_state_blocks = True
     if mode in {"oracle_audit", "marker_only_oracle", "low_motion_oracle", "high_motion_stress_test"}:
         args.mard_oracle_audit = True
     if mode == "none":

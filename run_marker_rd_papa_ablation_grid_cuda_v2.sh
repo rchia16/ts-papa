@@ -85,6 +85,11 @@ MARKER_QUALITY_Q="${MARKER_QUALITY_Q:-0.75}"
 MARKER_LOW_MOTION_Q="${MARKER_LOW_MOTION_Q:-0.25}"
 MARKER_HIGH_MOTION_Q="${MARKER_HIGH_MOTION_Q:-0.75}"
 MARKER_MIN_VALID="${MARKER_MIN_VALID:-20}"
+MARD_MARKER_TARGET="${MARD_MARKER_TARGET:-quality_state}"
+MARD_QUALITY_STATE_SOURCE_MODE="${MARD_QUALITY_STATE_SOURCE_MODE:-inferred}"
+MARD_QUALITY_STATE_DIM="${MARD_QUALITY_STATE_DIM:-compact}"
+MARD_QUALITY_STATE_THRESHOLD_MODE="${MARD_QUALITY_STATE_THRESHOLD_MODE:-subject_quantile}"
+MARD_USE_QUALITY_STATE_BLOCKS="${MARD_USE_QUALITY_STATE_BLOCKS:-0}"
 
 # CUDA-heavy MA-RD-PAPA post-hoc components, mirroring the CRA CUDA runner.
 MARD_RIDGE_BACKEND="${MARD_RIDGE_BACKEND:-torch}"
@@ -165,6 +170,10 @@ MARKER_COMMON_ARGS=(
     --marker-low-motion-q "${MARKER_LOW_MOTION_Q}"
     --marker-high-motion-q "${MARKER_HIGH_MOTION_Q}"
     --marker-min-valid "${MARKER_MIN_VALID}"
+    --mard-marker-target "${MARD_MARKER_TARGET}"
+    --mard-quality-state-source-mode "${MARD_QUALITY_STATE_SOURCE_MODE}"
+    --mard-quality-state-dim "${MARD_QUALITY_STATE_DIM}"
+    --mard-quality-state-threshold-mode "${MARD_QUALITY_STATE_THRESHOLD_MODE}"
     --mard-ridge-backend "${MARD_RIDGE_BACKEND}"
     --mard-gate-backend "${MARD_GATE_BACKEND}"
     --mard-torch-clf-epochs "${MARD_TORCH_CLF_EPOCHS}"
@@ -179,6 +188,12 @@ MARKER_COMMON_ARGS=(
     --mard-prefetch-factor "${MARD_PREFETCH_FACTOR}"
     "${RESP_DYN_ARGS[@]}"
 )
+
+if [ "${MARD_USE_QUALITY_STATE_BLOCKS}" = "1" ]; then
+    MARKER_COMMON_ARGS+=(--mard-use-quality-state-blocks)
+else
+    MARKER_COMMON_ARGS+=(--mard-no-quality-state-blocks)
+fi
 
 if [ "${MARD_PIN_MEMORY}" = "1" ]; then
     MARKER_COMMON_ARGS+=(--mard-pin-memory)
@@ -277,43 +292,32 @@ wait_for_all_devices() {
 case "${TIER}" in
   smoke)
     RUN_TAGS=(
-      "00_resp_ladder_smoke"
-      "01_marker_teacher_gate_smoke"
+      "00_resp_ladder"
+      "02_marker_quality_state_gate"
     )
     ;;
   core)
     RUN_TAGS=(
       "00_resp_ladder"
-      "01_rd_no_marker_primary"
-      "02_rd_no_marker_secondary"
-      "03_imu_activity_gate_no_marker"
-      "04_marker_teacher_motion_state"
-      "05_marker_quality_gate"
-      "06_marker_quality_hmm"
-      "07_marker_posture_profile_gate"
-      "08_marker_shuffled_teacher_control"
-      "09_time_only_control"
+      "01_imu_activity_gate_no_marker"
+      "02_marker_quality_state_gate"
+      "03_marker_quality_state_hmm"
+      "04_marker_quality_state_blocks"
+      "05_marker_quality_state_oracle_gate"
+      "06_shuffled_quality_state_control"
+      "07_time_only_quality_state_control"
     )
     ;;
   full)
     RUN_TAGS=(
       "00_resp_ladder"
-      "01_rd_no_marker_primary"
-      "02_rd_no_marker_secondary"
-      "03_rd_no_marker_tertiary"
-      "04_imu_activity_gate_no_marker"
-      "05_marker_teacher_motion_state"
-      "06_marker_quality_gate"
-      "07_marker_quality_hmm"
-      "08_marker_posture_profile_gate"
-      "09_marker_posture_profile_expert"
-      "10_marker_oracle_audit"
-      "11_marker_only_oracle_control"
-      "12_marker_shuffled_teacher_control"
-      "13_marker_time_shift_control"
-      "14_time_only_control"
-      "15_low_motion_only_oracle"
-      "16_high_motion_stress_test"
+      "01_imu_activity_gate_no_marker"
+      "02_marker_quality_state_gate"
+      "03_marker_quality_state_hmm"
+      "04_marker_quality_state_blocks"
+      "05_marker_quality_state_oracle_gate"
+      "06_shuffled_quality_state_control"
+      "07_time_only_quality_state_control"
     )
     ;;
   *)
@@ -335,108 +339,50 @@ run_tag_on_device() {
           --embed-pooling rich \
           --embed-stft-profile
         ;;
-      01_marker_teacher_gate_smoke)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode quality_gate \
-          --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
-        ;;
-      01_rd_no_marker_primary)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode none \
-          --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
-        ;;
-      02_rd_no_marker_secondary)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode none \
-          --marker-resp-variant "${SECONDARY_RESP_VARIANT}"
-        ;;
-      03_rd_no_marker_tertiary)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode none \
-          --marker-resp-variant "${TERTIARY_RESP_VARIANT}"
-        ;;
-      03_imu_activity_gate_no_marker|04_imu_activity_gate_no_marker)
+      01_imu_activity_gate_no_marker)
         maybe_run_marker "${tag}" "${device}" \
           "${MARKER_COMMON_ARGS[@]}" \
           --no-include-marker \
           --marker-mode imu_activity_gate \
           --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
         ;;
-      04_marker_teacher_motion_state|05_marker_teacher_motion_state)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode teacher_motion_state \
-          --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
-        ;;
-      05_marker_quality_gate|06_marker_quality_gate)
+      02_marker_quality_state_gate)
         maybe_run_marker "${tag}" "${device}" \
           "${MARKER_COMMON_ARGS[@]}" \
           --marker-mode quality_gate \
           --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
         ;;
-      06_marker_quality_hmm|07_marker_quality_hmm)
+      03_marker_quality_state_hmm)
         maybe_run_marker "${tag}" "${device}" \
           "${MARKER_COMMON_ARGS[@]}" \
           --marker-mode quality_gate \
           --marker-resp-variant "${PRIMARY_RESP_VARIANT}" \
-          --marker-motion-conditioned-hmm
+          --mard-quality-state-hmm
         ;;
-      07_marker_posture_profile_gate|08_marker_posture_profile_gate)
+      04_marker_quality_state_blocks)
         maybe_run_marker "${tag}" "${device}" \
           "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode posture_profile_gate \
+          --marker-mode quality_gate \
+          --mard-use-quality-state-blocks \
           --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
         ;;
-      09_marker_posture_profile_expert)
+      05_marker_quality_state_oracle_gate)
         maybe_run_marker "${tag}" "${device}" \
           "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode posture_profile_expert \
+          --marker-mode quality_state_oracle_gate \
+          --mard-quality-state-source-mode observed \
           --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
         ;;
-      10_marker_oracle_audit)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode oracle_audit \
-          --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
-        ;;
-      11_marker_only_oracle_control)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode marker_only_oracle \
-          --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
-        ;;
-      08_marker_shuffled_teacher_control|12_marker_shuffled_teacher_control)
+      06_shuffled_quality_state_control)
         maybe_run_marker "${tag}" "${device}" \
           "${MARKER_COMMON_ARGS[@]}" \
           --marker-mode shuffled_teacher_control \
           --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
         ;;
-      13_marker_time_shift_control)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode time_shift_control \
-          --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
-        ;;
-      09_time_only_control|14_time_only_control)
+      07_time_only_quality_state_control)
         maybe_run_marker "${tag}" "${device}" \
           "${MARKER_COMMON_ARGS[@]}" \
           --marker-mode time_only_control \
-          --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
-        ;;
-      15_low_motion_only_oracle)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode low_motion_oracle \
-          --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
-        ;;
-      16_high_motion_stress_test)
-        maybe_run_marker "${tag}" "${device}" \
-          "${MARKER_COMMON_ARGS[@]}" \
-          --marker-mode high_motion_stress_test \
           --marker-resp-variant "${PRIMARY_RESP_VARIANT}"
         ;;
       *)
